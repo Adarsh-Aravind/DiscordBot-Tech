@@ -27,6 +27,47 @@ pub fn bot_id(ctx: &serenity::Context) -> UserId {
     ctx.cache.current_user().id
 }
 
+/// Guild-level permissions implied by a set of roles, read from the cache.
+///
+/// Channel overwrites are deliberately ignored: this answers "does this person
+/// hold a moderator permission in this server", where the base roles are what
+/// matters. An empty set is returned when the guild is not cached, so callers
+/// decide for themselves whether that should fail open or closed.
+pub fn permissions_from_roles(
+    ctx: &serenity::Context,
+    guild_id: GuildId,
+    roles: &[RoleId],
+) -> Permissions {
+    let Some(guild) = guild_id.to_guild_cached(&ctx.cache) else {
+        return Permissions::empty();
+    };
+    let mut perms = Permissions::empty();
+    if let Some(everyone) = guild.roles.get(&RoleId::new(guild_id.get())) {
+        perms |= everyone.permissions;
+    }
+    for role_id in roles {
+        if let Some(role) = guild.roles.get(role_id) {
+            perms |= role.permissions;
+        }
+    }
+    perms
+}
+
+/// True when these roles carry one of the permissions we treat as staff.
+///
+/// Automod uses this so a moderator who was never given a role from
+/// `/config role` is still exempt from the automatic punishments. It is
+/// deliberately the same permission set as [`is_staff`].
+pub fn roles_are_staff(ctx: &serenity::Context, guild_id: GuildId, roles: &[RoleId]) -> bool {
+    let perms = permissions_from_roles(ctx, guild_id, roles);
+    perms.administrator()
+        || perms.manage_guild()
+        || perms.manage_messages()
+        || perms.kick_members()
+        || perms.ban_members()
+        || perms.moderate_members()
+}
+
 /// Highest role position held by a member. Returns -1 when nothing is cached.
 pub fn top_position(positions: &HashMap<RoleId, i64>, member: &Member) -> i64 {
     member
@@ -140,7 +181,14 @@ pub async fn is_staff(ctx: &Ctx<'_>) -> bool {
             return true;
         }
         if let Ok(perms) = member.permissions(ctx.serenity_context()) {
-            if perms.manage_messages() || perms.administrator() || perms.kick_members() {
+            // Keep this list in step with `roles_are_staff`, which automod uses.
+            if perms.administrator()
+                || perms.manage_guild()
+                || perms.manage_messages()
+                || perms.kick_members()
+                || perms.ban_members()
+                || perms.moderate_members()
+            {
                 return true;
             }
         }
@@ -156,7 +204,9 @@ pub async fn staff_only(ctx: Ctx<'_>) -> Result<bool, Error> {
     ctx.send(
         poise::CreateReply::default()
             .embed(crate::util::embed::err(
-                "This command is for staff only. An admin can grant access with `/config staffroles`.",
+                "This command is for staff only. It needs a moderator permission \
+                 (Manage Messages, Kick, Ban or Timeout), or a role set with \
+                 `/config staffroles`.",
             ))
             .ephemeral(true),
     )
@@ -213,28 +263,3 @@ pub async fn admin_only(ctx: Ctx<'_>) -> Result<bool, Error> {
     Ok(false)
 }
 
-/// Does the bot have the permission it needs in this guild?
-pub fn bot_has(ctx: &serenity::Context, guild_id: GuildId, needed: Permissions) -> bool {
-    let me = bot_id(ctx);
-    let Some(guild) = guild_id.to_guild_cached(&ctx.cache) else {
-        return true; // uncached: let Discord decide and surface its error
-    };
-    match guild.members.get(&me) {
-        Some(member) => {
-            let mut perms = Permissions::empty();
-            if guild.owner_id == me {
-                return true;
-            }
-            for role_id in &member.roles {
-                if let Some(role) = guild.roles.get(role_id) {
-                    perms |= role.permissions;
-                }
-            }
-            if let Some(everyone) = guild.roles.get(&RoleId::new(guild_id.get())) {
-                perms |= everyone.permissions;
-            }
-            perms.administrator() || perms.contains(needed)
-        }
-        None => true,
-    }
-}

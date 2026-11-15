@@ -1,7 +1,6 @@
 //! Welcome and goodbye messages, auto-roles, verification and the join/leave
 //! bookkeeping every other module relies on.
 
-pub mod invites;
 pub mod profiles;
 pub mod roles;
 
@@ -46,13 +45,8 @@ pub async fn handle_join(
     .execute(&data.db)
     .await?;
 
-    crate::modules::analytics::bump_daily(&data.db, guild_i64, "joins", 1).await;
-
     // Automod gets first look: it may kick or ban the account.
     let verdict = raid::handle_join(sctx, data, member).await?;
-
-    // Invite attribution runs regardless so the inviter's stats stay honest.
-    let inviter = invites::attribute_join(sctx, data, guild_id, member.user.id).await;
 
     let cfg = db::welcome_config(&data.db, guild_i64).await?;
 
@@ -76,13 +70,6 @@ pub async fn handle_join(
         .thumbnail(member.user.face())
         .footer(embed::footer(format!("User ID: {}", member.user.id.get())));
 
-    if let Some((inviter_id, uses)) = inviter {
-        log_embed = log_embed.field(
-            "Invited by",
-            format!("<@{inviter_id}> ({uses} invite(s))"),
-            true,
-        );
-    }
     if let Some(note) = &verdict.note {
         log_embed = log_embed.field("Automod", note.clone(), true);
     }
@@ -115,7 +102,7 @@ pub async fn handle_join(
 
     // ---- welcome message -------------------------------------------------
     if !member.user.bot {
-        send_welcome(sctx, data, member, &cfg, inviter.map(|(id, _)| id)).await;
+        send_welcome(sctx, data, member, &cfg).await;
     }
 
     Ok(())
@@ -126,7 +113,6 @@ async fn send_welcome(
     data: &Data,
     member: &Member,
     cfg: &WelcomeConfig,
-    inviter: Option<i64>,
 ) {
     let guild_id = member.guild_id;
     let member_count = guild_id
@@ -144,12 +130,9 @@ async fn send_welcome(
             crate::modules::moderation::guild_name(sctx, guild_id),
         ),
         ("count", member_count.to_string()),
-        (
-            "inviter",
-            inviter
-                .map(|id| format!("<@{id}>"))
-                .unwrap_or_else(|| "someone".to_string()),
-        ),
+        // Invite tracking was removed. Keep the old "unknown inviter" text so
+        // existing welcome messages that use {inviter} do not show raw braces.
+        ("inviter", "someone".to_string()),
     ];
 
     // Channel message.
@@ -201,7 +184,7 @@ async fn send_welcome(
     let _ = data;
 }
 
-/// Goodbye message, invite bookkeeping and the leave log.
+/// Goodbye message and the leave log.
 pub async fn handle_leave(
     sctx: &serenity::Context,
     data: &Data,
@@ -217,27 +200,6 @@ pub async fn handle_leave(
         .bind(user_id)
         .execute(&data.db)
         .await?;
-
-    crate::modules::analytics::bump_daily(&data.db, guild_i64, "leaves", 1).await;
-
-    // Credit the leave against whoever invited them.
-    let inviter: Option<i64> =
-        sqlx::query_scalar("SELECT inviter_id FROM members WHERE guild_id = ? AND user_id = ?")
-            .bind(guild_i64)
-            .bind(user_id)
-            .fetch_optional(&data.db)
-            .await?
-            .flatten();
-    if let Some(inviter_id) = inviter {
-        sqlx::query(
-            "INSERT INTO invite_stats (guild_id, user_id, departed) VALUES (?, ?, 1)
-             ON CONFLICT(guild_id, user_id) DO UPDATE SET departed = invite_stats.departed + 1",
-        )
-        .bind(guild_i64)
-        .bind(inviter_id)
-        .execute(&data.db)
-        .await?;
-    }
 
     let cfg = db::welcome_config(&data.db, guild_i64).await?;
 
@@ -261,13 +223,6 @@ pub async fn handle_leave(
         embed::titled("📤 Member left", embed::DANGER)
             .description(format!("<@{}> `{}`", user.id.get(), user.tag()))
             .field("Was here for", stayed, true)
-            .field(
-                "Invited by",
-                inviter
-                    .map(|id| format!("<@{id}>"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                true,
-            )
             .thumbnail(user.face())
             .footer(embed::footer(format!("User ID: {}", user.id.get()))),
     )
@@ -326,7 +281,7 @@ pub async fn welcome(_ctx: Ctx<'_>) -> Result<(), Error> {
 }
 
 const PLACEHOLDER_HELP: &str =
-    "Placeholders: `{mention}` `{user}` `{tag}` `{id}` `{server}` `{count}` `{inviter}`";
+    "Placeholders: `{mention}` `{user}` `{tag}` `{id}` `{server}` `{count}`";
 
 /// Where welcome messages are posted.
 #[poise::command(slash_command, rename = "channel", guild_only)]
@@ -526,7 +481,6 @@ pub async fn welcome_test(ctx: Ctx<'_>) -> Result<(), Error> {
             ctx.data(),
             &member,
             &cfg,
-            Some(ctx.author().id.get() as i64),
         )
         .await;
         ctx.send(
@@ -824,7 +778,6 @@ pub async fn grant_verification(
 pub fn commands() -> Vec<poise::Command<Data, Error>> {
     let mut all = vec![welcome(), verification()];
     all.extend(roles::commands());
-    all.extend(invites::commands());
     all.extend(profiles::commands());
     all
 }

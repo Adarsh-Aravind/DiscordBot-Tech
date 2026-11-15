@@ -1,6 +1,5 @@
-//! Member profiles, birthdays and per-member activity.
+//! Member profiles and per-member activity.
 
-use chrono::Datelike;
 use poise::serenity_prelude as serenity;
 use serenity::User;
 
@@ -53,7 +52,6 @@ pub async fn profile_view(
         color: String,
         banner_url: Option<String>,
         badge: String,
-        birthday: Option<String>,
         timezone: Option<String>,
         pronouns: String,
         favourite: String,
@@ -106,9 +104,6 @@ pub async fn profile_view(
     }
     if let Some(tz) = &row.timezone {
         e = e.field("Timezone", tz.clone(), true);
-    }
-    if let Some(birthday) = &row.birthday {
-        e = e.field("Birthday", birthday.clone(), true);
     }
     if !row.favourite.trim().is_empty() {
         e = e.field("Favourite tech", text::truncate(&row.favourite, 200), true);
@@ -205,18 +200,22 @@ pub async fn profile_colour(
     let guild_id = ctx.guild_id().unwrap().get() as i64;
     let user_id = ctx.author().id.get() as i64;
 
-    if embed::parse_colour(&colour).is_none() {
+    // Parse once, store the canonical form. Re-parsing what we formatted
+    // ourselves used to be able to fail, which meant an `unwrap` on `None`.
+    let Some(value) = embed::colour_value(&colour) else {
         ctx.send(
             poise::CreateReply::default()
-                .embed(embed::err("That is not a hex colour. Try `#5865F2`."))
+                .embed(embed::err(
+                    "That is not a colour I recognise. Try `#5865F2`.",
+                ))
                 .ephemeral(true),
         )
         .await?;
         return Ok(());
-    }
+    };
+    let normalised = embed::canonical_colour(value);
 
     ensure_profile(ctx.data(), guild_id, user_id).await?;
-    let normalised = format!("#{}", colour.trim().trim_start_matches('#').to_lowercase());
     sqlx::query("UPDATE profiles SET color = ? WHERE guild_id = ? AND user_id = ?")
         .bind(&normalised)
         .bind(guild_id)
@@ -228,7 +227,7 @@ pub async fn profile_colour(
         poise::CreateReply::default()
             .embed(
                 serenity::CreateEmbed::new()
-                    .colour(embed::parse_colour(&normalised).unwrap())
+                    .colour(embed::colour(value))
                     .description(format!("✅ Accent colour set to `{normalised}`.")),
             )
             .ephemeral(true),
@@ -285,7 +284,7 @@ pub async fn profile_favourite(
     Ok(())
 }
 
-/// Your timezone, used by reminders and birthdays.
+/// Your timezone, used by reminders.
 #[poise::command(slash_command, rename = "timezone", guild_only)]
 pub async fn profile_timezone(
     ctx: Ctx<'_>,
@@ -383,193 +382,6 @@ pub async fn profile_clear(ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-// ===========================================================================
-// Birthdays
-// ===========================================================================
-
-/// Birthday announcements.
-#[poise::command(
-    slash_command,
-    guild_only,
-    category = "Community",
-    subcommands("birthday_set", "birthday_remove", "birthday_upcoming", "birthday_channel")
-)]
-pub async fn birthday(_ctx: Ctx<'_>) -> Result<(), Error> {
-    Ok(())
-}
-
-/// Tell the bot your birthday. The year is never stored.
-#[poise::command(slash_command, rename = "set", guild_only)]
-pub async fn birthday_set(
-    ctx: Ctx<'_>,
-    #[description = "Day of the month"]
-    #[min = 1]
-    #[max = 31]
-    day: u8,
-    #[description = "Month"]
-    #[min = 1]
-    #[max = 12]
-    month: u8,
-) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap().get() as i64;
-    let user_id = ctx.author().id.get() as i64;
-
-    // Reject 31 February and friends.
-    if chrono::NaiveDate::from_ymd_opt(2024, month as u32, day as u32).is_none() {
-        ctx.send(
-            poise::CreateReply::default()
-                .embed(embed::err("That date does not exist."))
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    ensure_profile(ctx.data(), guild_id, user_id).await?;
-    let stored = format!("{month:02}-{day:02}");
-    sqlx::query("UPDATE profiles SET birthday = ? WHERE guild_id = ? AND user_id = ?")
-        .bind(&stored)
-        .bind(guild_id)
-        .bind(user_id)
-        .execute(&ctx.data().db)
-        .await?;
-
-    ctx.send(
-        poise::CreateReply::default()
-            .embed(embed::ok(format!(
-                "Birthday saved as **{day:02}/{month:02}**. Only the day and month are kept."
-            )))
-            .ephemeral(true),
-    )
-    .await?;
-    Ok(())
-}
-
-/// Remove your birthday.
-#[poise::command(slash_command, rename = "remove", guild_only)]
-pub async fn birthday_remove(ctx: Ctx<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap().get() as i64;
-    let user_id = ctx.author().id.get() as i64;
-    sqlx::query("UPDATE profiles SET birthday = NULL WHERE guild_id = ? AND user_id = ?")
-        .bind(guild_id)
-        .bind(user_id)
-        .execute(&ctx.data().db)
-        .await?;
-    ctx.send(
-        poise::CreateReply::default()
-            .embed(embed::ok("Birthday removed."))
-            .ephemeral(true),
-    )
-    .await?;
-    Ok(())
-}
-
-/// Birthdays coming up in the next 30 days.
-#[poise::command(slash_command, rename = "upcoming", guild_only)]
-pub async fn birthday_upcoming(ctx: Ctx<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap().get() as i64;
-    let rows: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT user_id, birthday FROM profiles WHERE guild_id = ? AND birthday IS NOT NULL",
-    )
-    .bind(guild_id)
-    .fetch_all(&ctx.data().db)
-    .await?;
-
-    let today = chrono::Utc::now().date_naive();
-    let mut upcoming: Vec<(i64, i64, String)> = Vec::new();
-
-    for (user_id, birthday) in rows {
-        let Some((month, day)) = parse_birthday(&birthday) else {
-            continue;
-        };
-        // Days until the next occurrence.
-        let mut year = today.year();
-        let mut next = chrono::NaiveDate::from_ymd_opt(year, month, day);
-        if next.map(|d| d < today).unwrap_or(true) {
-            year += 1;
-            next = chrono::NaiveDate::from_ymd_opt(year, month, day);
-        }
-        if let Some(next) = next {
-            let days = (next - today).num_days();
-            if days <= 30 {
-                upcoming.push((days, user_id, next.format("%d %b").to_string()));
-            }
-        }
-    }
-
-    upcoming.sort_by_key(|(days, _, _)| *days);
-
-    let body = if upcoming.is_empty() {
-        "No birthdays in the next 30 days. Add yours with `/birthday set`.".to_string()
-    } else {
-        upcoming
-            .iter()
-            .map(|(days, user_id, date)| {
-                if *days == 0 {
-                    format!("🎉 **Today** — <@{user_id}>")
-                } else {
-                    format!("**{date}** (in {days} day(s)) — <@{user_id}>")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    ctx.send(
-        poise::CreateReply::default()
-            .embed(embed::titled("🎂 Upcoming birthdays", embed::BRAND).description(body)),
-    )
-    .await?;
-    Ok(())
-}
-
-/// Where birthday announcements are posted.
-#[poise::command(
-    slash_command,
-    rename = "channel",
-    guild_only,
-    check = "crate::util::perms::admin_only"
-)]
-pub async fn birthday_channel(
-    ctx: Ctx<'_>,
-    #[description = "Announcement channel"] channel: serenity::GuildChannel,
-    #[description = "Role given for the day"] role: Option<serenity::Role>,
-) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap().get() as i64;
-    crate::db::set_opt_i64(
-        &ctx.data().db,
-        "guild_config",
-        "birthday_channel",
-        guild_id,
-        Some(channel.id.get() as i64),
-    )
-    .await?;
-    if let Some(role) = &role {
-        crate::db::set_opt_i64(
-            &ctx.data().db,
-            "guild_config",
-            "birthday_role",
-            guild_id,
-            Some(role.id.get() as i64),
-        )
-        .await?;
-    }
-    ctx.send(poise::CreateReply::default().embed(embed::ok(format!(
-        "Birthday announcements will go to <#{}>.",
-        channel.id.get()
-    ))))
-    .await?;
-    Ok(())
-}
-
-/// `MM-DD` -> (month, day)
-pub fn parse_birthday(raw: &str) -> Option<(u32, u32)> {
-    let mut parts = raw.split('-');
-    let month = parts.next()?.parse().ok()?;
-    let day = parts.next()?.parse().ok()?;
-    Some((month, day))
-}
-
 pub fn commands() -> Vec<poise::Command<Data, Error>> {
-    vec![profile(), birthday()]
+    vec![profile()]
 }

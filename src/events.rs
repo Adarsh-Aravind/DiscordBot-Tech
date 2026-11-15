@@ -1,12 +1,12 @@
 //! The single gateway event handler. It dispatches to the modules and keeps
-//! the bookkeeping (message log, analytics, snipes) in one place.
+//! the bookkeeping (message log, snipes) in one place.
 
 use chrono::Utc;
 use poise::serenity_prelude as serenity;
 use serenity::{FullEvent, GuildId};
 
 use crate::logs::{self, Log};
-use crate::modules::{analytics, automation, automod, community, leveling, tickets, voice, welcome};
+use crate::modules::{automod, community, leveling, voice, welcome};
 use crate::state::{Data, Error, Snipe};
 use crate::util::{embed, text, time};
 
@@ -33,14 +33,12 @@ pub async fn handle(
             tracing::info!(guilds = guilds.len(), "cache ready");
             for guild_id in guilds {
                 let _ = crate::db::ensure_guild(&data.db, guild_id.get() as i64).await;
-                welcome::invites::refresh_cache(sctx, data, *guild_id).await;
             }
             voice::cleanup_orphans(sctx, &data.db).await;
         }
 
         FullEvent::GuildCreate { guild, is_new } => {
             let _ = crate::db::ensure_guild(&data.db, guild.id.get() as i64).await;
-            welcome::invites::refresh_cache(sctx, data, guild.id).await;
             if is_new.unwrap_or(false) {
                 tracing::info!(guild = %guild.name, "joined a new server");
             }
@@ -94,53 +92,11 @@ pub async fn handle(
         // ===================================================================
         FullEvent::GuildMemberAddition { new_member } => {
             welcome::handle_join(sctx, data, new_member).await?;
-            automation::fire(
-                sctx,
-                data,
-                new_member.guild_id,
-                "member_join",
-                automation::WorkflowContext {
-                    user_id: new_member.user.id.get(),
-                    ..Default::default()
-                },
-            )
-            .await;
             community::misc::check_member_milestone(sctx, data, new_member.guild_id).await;
-            automation::notify_webhooks(
-                data,
-                new_member.guild_id.get() as i64,
-                "join",
-                serde_json::json!({
-                    "user_id": new_member.user.id.get().to_string(),
-                    "tag": new_member.user.tag(),
-                }),
-            )
-            .await;
         }
 
         FullEvent::GuildMemberRemoval { guild_id, user, .. } => {
             welcome::handle_leave(sctx, data, *guild_id, user).await?;
-            automation::fire(
-                sctx,
-                data,
-                *guild_id,
-                "member_leave",
-                automation::WorkflowContext {
-                    user_id: user.id.get(),
-                    ..Default::default()
-                },
-            )
-            .await;
-            automation::notify_webhooks(
-                data,
-                guild_id.get() as i64,
-                "leave",
-                serde_json::json!({
-                    "user_id": user.id.get().to_string(),
-                    "tag": user.tag(),
-                }),
-            )
-            .await;
         }
 
         FullEvent::GuildMemberUpdate {
@@ -191,17 +147,6 @@ pub async fn handle(
         }
 
         // ===================================================================
-        // Reactions (starboard)
-        // ===================================================================
-        FullEvent::ReactionAdd { add_reaction } => {
-            community::starboard::handle_reaction(sctx, data, add_reaction).await?;
-        }
-
-        FullEvent::ReactionRemove { removed_reaction } => {
-            community::starboard::handle_reaction(sctx, data, removed_reaction).await?;
-        }
-
-        // ===================================================================
         // Interactions
         // ===================================================================
         FullEvent::InteractionCreate { interaction } => {
@@ -216,10 +161,9 @@ pub async fn handle(
         FullEvent::GuildAuditLogEntryCreate { entry, guild_id } => {
             let label = format!("{:?}", entry.action);
             let target = entry.target_id.map(|id| format!("`{}`", id.get()));
-            if let Some(actor) = entry.user_id {
-                automod::nuke::handle_audit_entry(sctx, data, *guild_id, actor, &label, target)
-                    .await;
-            }
+            // serenity 0.12.5 types this as `UserId`, not `Option<UserId>`.
+            let actor = entry.user_id;
+            automod::nuke::handle_audit_entry(sctx, data, *guild_id, actor, &label, target).await;
         }
 
         FullEvent::ChannelDelete { channel, .. } => {
@@ -231,17 +175,6 @@ pub async fn handle(
                 embed::titled("🗑️ Channel deleted", embed::DANGER)
                     .description(format!("`#{}` (`{}`)", channel.name, channel.id.get())),
             )
-            .await;
-
-            // A deleted ticket channel should not leave a dangling open ticket.
-            let _ = sqlx::query(
-                "UPDATE tickets SET status = 'closed', closed_at = ?, close_reason = ?
-                 WHERE channel_id = ? AND status = 'open'",
-            )
-            .bind(time::sql_now())
-            .bind("Channel was deleted")
-            .bind(channel.id.get() as i64)
-            .execute(&data.db)
             .await;
 
             let _ = sqlx::query("DELETE FROM temp_voice WHERE channel_id = ?")
@@ -294,21 +227,6 @@ pub async fn handle(
             .await;
         }
 
-        // ===================================================================
-        // Invites
-        // ===================================================================
-        FullEvent::InviteCreate { data: invite } => {
-            if let Some(guild_id) = invite.guild_id {
-                welcome::invites::refresh_cache(sctx, data, guild_id).await;
-            }
-        }
-
-        FullEvent::InviteDelete { data: invite } => {
-            if let Some(guild_id) = invite.guild_id {
-                welcome::invites::refresh_cache(sctx, data, guild_id).await;
-            }
-        }
-
         _ => {}
     }
 
@@ -353,65 +271,22 @@ async fn on_message(
     .execute(&data.db)
     .await;
 
-    // Automod gets first say: it may delete the message.
-    automod::scan::handle_message(sctx, data, message).await?;
+    // Automod gets first say: it may delete the message or remove its author.
+    // If it did, nothing below should reward the message - no XP, no game move.
+    if automod::scan::handle_message(sctx, data, message).await? {
+        return Ok(());
+    }
 
-    // Statistics and XP.
-    analytics::record_message(data, message).await;
+    // XP.
     leveling::handle_message(sctx, data, message).await?;
 
     // AFK bookkeeping and mention replies.
     crate::modules::utility::handle_afk(sctx, data, message).await?;
 
     // Channel games.
-    if community::handle_message(sctx, data, message).await? {
-        return Ok(());
-    }
-
-    // Ticket transcripts.
-    if tickets::ticket_by_channel(&data.db, message.channel_id.get() as i64)
-        .await
-        .is_some()
-    {
-        let is_staff = is_support_staff(data, guild_i64, message).await;
-        tickets::record_message(data, message, is_staff).await;
-    }
-
-    // Custom text commands.
-    automation::try_custom_command(sctx, data, message).await?;
+    community::handle_message(sctx, data, message).await?;
 
     Ok(())
-}
-
-/// Does this message's author count as support staff?
-async fn is_support_staff(data: &Data, guild_id: i64, message: &serenity::Message) -> bool {
-    let Ok(cfg) = crate::db::ticket_config(&data.db, guild_id).await else {
-        return false;
-    };
-    let support = crate::db::csv_ids(&cfg.support_roles);
-
-    if let Some(member) = &message.member {
-        if member
-            .roles
-            .iter()
-            .any(|r| support.contains(&(r.get() as i64)))
-        {
-            return true;
-        }
-    }
-    if let Ok(guild) = crate::db::guild_config(&data.db, guild_id).await {
-        let staff: Vec<i64> = crate::db::csv_ids(&guild.mod_roles)
-            .into_iter()
-            .chain(crate::db::csv_ids(&guild.admin_roles))
-            .chain(crate::db::csv_ids(&guild.staff_roles))
-            .collect();
-        if let Some(member) = &message.member {
-            if member.roles.iter().any(|r| staff.contains(&(r.get() as i64))) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 async fn on_message_update(
@@ -658,9 +533,6 @@ async fn on_component(
     let result = async {
         if welcome::roles::handle_component(sctx, data, component).await? {
             return Ok::<bool, Error>(true);
-        }
-        if tickets::handle_component(sctx, data, component).await? {
-            return Ok(true);
         }
         if community::handle_component(sctx, data, component).await? {
             return Ok(true);

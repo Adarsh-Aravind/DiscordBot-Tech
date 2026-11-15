@@ -153,8 +153,9 @@ pub async fn purge(
     Ok(())
 }
 
-/// Delete every message from a member across the last 100 messages of each
-/// channel they were active in. Useful after a spam raid.
+/// Delete a member's recent messages in every channel they were active in.
+///
+/// Scans up to the last 100 messages of each channel. Useful after a spam raid.
 #[poise::command(
     slash_command,
     guild_only,

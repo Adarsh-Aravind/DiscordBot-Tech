@@ -34,6 +34,17 @@ pub struct Snipe {
     pub at: DateTime<Utc>,
 }
 
+/// The last thing we saw a member say, for duplicate detection.
+#[derive(Clone, Debug)]
+pub struct LastMessage {
+    pub content: String,
+    pub repeats: u32,
+    /// When it was last updated, so the sweep in [`crate::tasks`] can forget
+    /// members who have gone quiet instead of keeping a row per member for the
+    /// lifetime of the process.
+    pub at: Instant,
+}
+
 /// Sliding-window counter used by anti-spam / anti-flood / anti-raid.
 #[derive(Default, Debug)]
 pub struct Window {
@@ -73,7 +84,7 @@ pub struct BotState {
     /// guild -> join timestamps, for anti-raid.
     pub joins: DashMap<u64, Window>,
     /// (guild, user) -> last content + repeat count, for duplicate detection.
-    pub duplicates: DashMap<(u64, u64), (String, u32)>,
+    pub duplicates: DashMap<(u64, u64), LastMessage>,
     /// (guild, actor) -> destructive-action timestamps, for anti-nuke.
     pub nuke: DashMap<(u64, u64), Window>,
     /// Guilds currently in raid mode (joins gated, channels locked).

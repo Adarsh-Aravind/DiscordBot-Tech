@@ -1,13 +1,12 @@
-//! Community engagement: polls, suggestions, giveaways, events, games,
-//! starboard, confessions, quotes, challenges and milestones.
+//! Community engagement: polls, anonymous feedback, giveaways, events, games,
+//! quotes, challenges and milestones.
 
 pub mod events;
+pub mod feedback;
 pub mod games;
 pub mod giveaways;
 pub mod misc;
 pub mod polls;
-pub mod starboard;
-pub mod suggestions;
 
 use poise::serenity_prelude as serenity;
 use serenity::ComponentInteraction;
@@ -21,9 +20,6 @@ pub async fn handle_component(
     interaction: &ComponentInteraction,
 ) -> Result<bool, Error> {
     if polls::handle_component(sctx, data, interaction).await? {
-        return Ok(true);
-    }
-    if suggestions::handle_component(sctx, data, interaction).await? {
         return Ok(true);
     }
     if giveaways::handle_component(sctx, data, interaction).await? {
@@ -57,14 +53,12 @@ pub async fn handle_message(
 pub fn commands() -> Vec<poise::Command<Data, Error>> {
     let mut all = vec![
         polls::poll(),
-        suggestions::suggest(),
-        suggestions::feedback(),
-        suggestions::feedbackchannel(),
+        feedback::feedback(),
+        feedback::feedbackchannel(),
         giveaways::giveaway(),
         events::event(),
     ];
     all.extend(games::commands());
-    all.extend(starboard::commands());
     all.extend(misc::commands());
     all
 }

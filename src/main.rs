@@ -36,6 +36,8 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = Config::from_env()?;
+    // New guild rows start with this prefix; `/config prefix` overrides it.
+    db::set_default_prefix(&config.prefix);
     tracing::info!("starting up");
 
     let pool = db::connect(&config.database_url).await?;
@@ -45,16 +47,30 @@ async fn main() -> anyhow::Result<()> {
         | serenity::GatewayIntents::GUILD_MEMBERS
         | serenity::GatewayIntents::GUILD_MESSAGES
         | serenity::GatewayIntents::MESSAGE_CONTENT
-        | serenity::GatewayIntents::GUILD_MESSAGE_REACTIONS
         | serenity::GatewayIntents::GUILD_VOICE_STATES
         | serenity::GatewayIntents::GUILD_MODERATION
-        | serenity::GatewayIntents::GUILD_INVITES
         | serenity::GatewayIntents::DIRECT_MESSAGES;
 
     let options = poise::FrameworkOptions {
         commands: modules::all(),
         prefix_options: poise::PrefixFrameworkOptions {
+            // The env value is the fallback. Each guild's own prefix comes from
+            // `dynamic_prefix` below: without it, `/config prefix` changed only
+            // which word triggered a custom command, and `!ban` kept answering
+            // to the process-wide prefix whatever the server had configured.
             prefix: Some(config.prefix.clone()),
+            dynamic_prefix: Some(|ctx: poise::PartialContext<'_, Data, Error>| {
+                Box::pin(async move {
+                    let Some(guild_id) = ctx.guild_id else {
+                        return Ok(None);
+                    };
+                    // Cached, so this costs nothing per message.
+                    Ok(db::guild_config(&ctx.data.db, guild_id.get() as i64)
+                        .await
+                        .ok()
+                        .map(|cfg| cfg.prefix))
+                })
+            }),
             mention_as_prefix: true,
             case_insensitive_commands: true,
             ..Default::default()
@@ -76,15 +92,6 @@ async fn main() -> anyhow::Result<()> {
         post_command: |ctx| {
             Box::pin(async move {
                 ctx.data().commands_run.fetch_add(1, Ordering::Relaxed);
-                if let Some(guild_id) = ctx.guild_id() {
-                    modules::analytics::record_command(
-                        &ctx.data().db,
-                        guild_id.get() as i64,
-                        &ctx.command().qualified_name,
-                        false,
-                    )
-                    .await;
-                }
             })
         },
         // One place decides who may run what, including every subcommand.
@@ -180,16 +187,6 @@ async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
                 command = %ctx.command().qualified_name,
                 "command failed: {error}"
             );
-
-            if let Some(guild_id) = ctx.guild_id() {
-                modules::analytics::record_command(
-                    &ctx.data().db,
-                    guild_id.get() as i64,
-                    &ctx.command().qualified_name,
-                    true,
-                )
-                .await;
-            }
 
             let _ = ctx
                 .send(

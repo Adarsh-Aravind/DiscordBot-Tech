@@ -8,15 +8,14 @@ pub static INVITE_RE: Lazy<Regex> = Lazy::new(|| {
         .expect("invite regex")
 });
 
-pub static URL_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\bhttps?://([a-z0-9\-._~%]+)(?:[:/][^\s]*)?").expect("url regex")
-});
+/// Captures the whole authority of a URL - everything between `://` and the
+/// path, query or fragment - so [`find_domains`] can work out which part of it
+/// is really the host.
+pub static URL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bhttps?://([^\s/?#]+)").expect("url regex"));
 
 pub static MENTION_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"<@!?(\d+)>").expect("mention regex"));
-
-pub static EMOJI_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"<a?:([a-zA-Z0-9_]+):(\d+)>").expect("emoji regex"));
 
 /// Cut a string to `max` characters, appending an ellipsis when it was cut.
 pub fn truncate(input: &str, max: usize) -> String {
@@ -99,11 +98,38 @@ pub fn find_domains(content: &str) -> Vec<String> {
     URL_RE
         .captures_iter(content)
         .filter_map(|c| c.get(1))
-        .map(|m| {
-            let host = m.as_str().to_lowercase();
-            host.trim_start_matches("www.").to_string()
-        })
+        .filter_map(|m| host_of(m.as_str()))
         .collect()
+}
+
+/// The host out of a URL authority.
+///
+/// `https://discord.com@evil.site/free-nitro` has an authority of
+/// `discord.com@evil.site`, and a browser goes to `evil.site` - everything
+/// before the last `@` is a username. Reading the host as "the text right after
+/// `https://`" meant a scam link could name any domain it liked and sail past
+/// both the phishing list and the link allowlist.
+fn host_of(authority: &str) -> Option<String> {
+    // Userinfo can itself contain '@', so the host is after the *last* one.
+    let after_userinfo = authority.rsplit('@').next()?;
+
+    // Strip the port, and the brackets around an IPv6 literal.
+    let host = if let Some(rest) = after_userinfo.strip_prefix('[') {
+        rest.split(']').next()?
+    } else {
+        after_userinfo.split(':').next()?
+    };
+
+    let host = host.trim_end_matches('.').to_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
 }
 
 /// Fold common letter substitutions so `fr33` matches `free` in the word filter.
@@ -155,33 +181,26 @@ pub fn similarity(a: &str, b: &str) -> f64 {
     matching as f64 / max_len as f64
 }
 
-/// Human readable byte size.
-pub fn bytes(size: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = size as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{size} B")
-    } else {
-        format!("{value:.2} {}", UNITS[unit])
-    }
-}
-
 /// Split a long body into Discord-safe chunks on line boundaries.
+///
+/// A single line longer than `max` is broken up as well. Passing it through
+/// whole produced a "page" over the limit, which Discord then rejected - the
+/// one case where chunking mattered most.
 pub fn chunk(body: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
     let mut pages = Vec::new();
     let mut current = String::new();
+
     for line in body.lines() {
-        if current.chars().count() + line.chars().count() + 1 > max && !current.is_empty() {
-            pages.push(std::mem::take(&mut current));
+        for piece in split_long_line(line, max) {
+            if current.chars().count() + piece.chars().count() + 1 > max && !current.is_empty() {
+                pages.push(std::mem::take(&mut current));
+            }
+            current.push_str(&piece);
+            current.push('\n');
         }
-        current.push_str(line);
-        current.push('\n');
     }
+
     if !current.trim().is_empty() {
         pages.push(current);
     }
@@ -191,8 +210,158 @@ pub fn chunk(body: &str, max: usize) -> Vec<String> {
     pages
 }
 
+/// Break one over-long line into pieces of at most `max` characters, on a word
+/// boundary where there is one.
+fn split_long_line(line: &str, max: usize) -> Vec<String> {
+    if line.chars().count() <= max {
+        return vec![line.to_string()];
+    }
+
+    let mut pieces = Vec::new();
+    let mut current = String::new();
+
+    for word in line.split_inclusive(char::is_whitespace) {
+        // A single word longer than the whole limit has to be cut mid-word.
+        if word.chars().count() > max {
+            if !current.is_empty() {
+                pieces.push(std::mem::take(&mut current));
+            }
+            let mut piece = String::new();
+            for ch in word.chars() {
+                if piece.chars().count() == max {
+                    pieces.push(std::mem::take(&mut piece));
+                }
+                piece.push(ch);
+            }
+            current = piece;
+            continue;
+        }
+
+        if current.chars().count() + word.chars().count() > max && !current.is_empty() {
+            pieces.push(std::mem::take(&mut current));
+        }
+        current.push_str(word);
+    }
+
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    pieces
+}
+
 /// Digits only, for the counting game.
 pub fn parse_leading_number(content: &str) -> Option<i64> {
     let token = content.split_whitespace().next()?;
     token.trim().parse::<i64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_host_not_the_username() {
+        // The classic trick: the part before '@' is a username, so this link
+        // actually goes to evil.site.
+        assert_eq!(
+            find_domains("look https://discord.com@evil.site/free-nitro"),
+            vec!["evil.site".to_string()]
+        );
+        assert_eq!(
+            find_domains("https://a@b@steamcommunity.com.scam.ru/x"),
+            vec!["steamcommunity.com.scam.ru".to_string()]
+        );
+    }
+
+    #[test]
+    fn reads_ordinary_links() {
+        assert_eq!(
+            find_domains("see https://www.Example.COM/path?x=1 and http://media.discordapp.net/a.png"),
+            vec!["example.com".to_string(), "media.discordapp.net".to_string()]
+        );
+        assert_eq!(
+            find_domains("https://example.com:8443/x"),
+            vec!["example.com".to_string()]
+        );
+        assert_eq!(
+            find_domains("https://[2606:4700::1111]/x"),
+            vec!["2606:4700::1111".to_string()]
+        );
+        assert!(find_domains("no links here").is_empty());
+    }
+
+    #[test]
+    fn finds_invites() {
+        assert_eq!(find_invites("join discord.gg/abc123"), vec!["abc123"]);
+        assert!(find_invites("nothing").is_empty());
+    }
+
+    #[test]
+    fn chunks_stay_within_the_limit() {
+        let body = (0..50)
+            .map(|i| format!("line number {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for page in chunk(&body, 60) {
+            assert!(page.chars().count() <= 61, "page too long: {page:?}");
+        }
+    }
+
+    #[test]
+    fn a_single_long_line_is_split() {
+        let body = "x".repeat(500);
+        let pages = chunk(&body, 100);
+        assert!(pages.len() >= 5, "got {} pages", pages.len());
+        for page in &pages {
+            assert!(page.chars().count() <= 101, "page too long: {}", page.len());
+        }
+        // Nothing is lost in the splitting.
+        let rebuilt: String = pages.iter().map(|p| p.trim_end_matches('\n')).collect();
+        assert_eq!(rebuilt, body);
+    }
+
+    #[test]
+    fn long_lines_break_on_words_when_they_can() {
+        let body = "alpha beta gamma delta epsilon zeta eta theta";
+        let pages = chunk(body, 20);
+        for page in &pages {
+            assert!(page.chars().count() <= 21);
+        }
+        assert!(pages[0].starts_with("alpha"));
+    }
+
+    #[test]
+    fn empty_body_still_says_something() {
+        assert_eq!(chunk("", 100).len(), 1);
+    }
+
+    #[test]
+    fn whole_words_only() {
+        assert!(contains_word("that is classic", "classic"));
+        assert!(!contains_word("that is classic", "ass"));
+        assert!(contains_word("an ass of a word", "ass"));
+    }
+
+    #[test]
+    fn truncate_counts_characters() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello", 3).chars().count(), 3);
+        // Multi-byte input must not be cut mid-character.
+        let long = "é".repeat(50);
+        assert_eq!(truncate(&long, 10).chars().count(), 10);
+    }
+
+    #[test]
+    fn caps_ratio_ignores_short_messages() {
+        assert_eq!(caps_ratio("HI"), 0);
+        assert_eq!(caps_ratio("SHOUTING LOUDLY"), 100);
+        assert_eq!(caps_ratio("quiet enough here"), 0);
+    }
+
+    #[test]
+    fn counts_unique_mentions() {
+        assert_eq!(count_mentions("<@1> <@1> <@2>"), 2);
+        assert_eq!(count_mentions("hey @everyone"), 1);
+        assert_eq!(count_mentions("nobody"), 0);
+    }
 }

@@ -12,6 +12,11 @@ use crate::util::{embed, perms, text};
 
 const LETTERS: [&str; 4] = ["🇦", "🇧", "🇨", "🇩"];
 
+/// How long a posted trivia question stays answerable. Long enough that a
+/// question left overnight still works, short enough that the keys do not pile
+/// up for ever.
+const TRIVIA_TTL_SECS: i64 = 24 * 3600;
+
 // ===========================================================================
 // Trivia
 // ===========================================================================
@@ -103,11 +108,15 @@ pub async fn trivia_play(
         use rand::Rng;
         rand::thread_rng().gen()
     };
-    db::kv_set(
+    // The answer key is short lived: it expires on its own, and the sweep in
+    // `tasks` only removes keys that are past their expiry. Deleting every
+    // `trivia.%` key on a timer used to break whatever questions were open.
+    db::kv_set_with_ttl(
         &ctx.data().db,
         guild_id,
         &format!("trivia.{nonce}"),
         &format!("{question_id}|{correct_index}|{}", choices.join("\u{1f}")),
+        TRIVIA_TTL_SECS,
     )
     .await?;
 
@@ -330,7 +339,9 @@ pub async fn handle_component(
         answer(sctx, interaction, "You have already answered this one.").await?;
         return Ok(true);
     }
-    db::kv_set(&data.db, guild_i64, &answered_key, "1").await?;
+    // Same lifetime as the answer key itself, so the two go away together and
+    // nobody can answer a question twice because only one of them expired.
+    db::kv_set_with_ttl(&data.db, guild_i64, &answered_key, "1", TRIVIA_TTL_SECS).await?;
 
     let user_i64 = interaction.user.id.get() as i64;
     let was_right = chosen == correct_index;
@@ -427,6 +438,7 @@ pub async fn counting(_ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Turn a channel into a counting channel.
 #[poise::command(slash_command, rename = "setup", guild_only)]
 pub async fn counting_setup(
     ctx: Ctx<'_>,
@@ -452,6 +464,7 @@ pub async fn counting_setup(
     Ok(())
 }
 
+/// The current count and the record.
 #[poise::command(slash_command, rename = "status", guild_only)]
 pub async fn counting_status(ctx: Ctx<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().unwrap().get() as i64;
@@ -480,6 +493,7 @@ pub async fn counting_status(ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Stop counting in a channel.
 #[poise::command(slash_command, rename = "off", guild_only)]
 pub async fn counting_off(
     ctx: Ctx<'_>,
@@ -612,6 +626,7 @@ pub async fn wordchain(_ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Turn a channel into a word chain game.
 #[poise::command(slash_command, rename = "setup", guild_only)]
 pub async fn wordchain_setup(
     ctx: Ctx<'_>,
@@ -640,6 +655,7 @@ pub async fn wordchain_setup(
     Ok(())
 }
 
+/// Show the word chain status.
 #[poise::command(slash_command, rename = "status", guild_only)]
 pub async fn wordchain_status(ctx: Ctx<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().unwrap().get() as i64;
@@ -672,6 +688,7 @@ pub async fn wordchain_status(ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Stop the word chain in a channel.
 #[poise::command(slash_command, rename = "off", guild_only)]
 pub async fn wordchain_off(
     ctx: Ctx<'_>,

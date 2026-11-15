@@ -3,8 +3,11 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use once_cell::sync::Lazy;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
+
+use crate::util::cache::TtlCache;
 
 pub type Db = SqlitePool;
 
@@ -38,26 +41,203 @@ pub async fn connect(url: &str) -> anyhow::Result<Db> {
     Ok(pool)
 }
 
+/// Columns added after the first release.
+///
+/// `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so
+/// a new column needs an `ALTER`. SQLite has no `ADD COLUMN IF NOT EXISTS`, so
+/// each of these runs on every boot and the "duplicate column" error that comes
+/// back on an already-migrated database is expected.
+const ADDITIVE_MIGRATIONS: &[&str] = &["ALTER TABLE kv_settings ADD COLUMN expires_at TEXT"];
+
+/// Tables of features that were removed (analytics, tickets, starboard,
+/// suggestions, confessions, invite tracking, scheduled messages, custom
+/// commands, workflows, webhooks and weekly reports). Dropped on every boot;
+/// `IF EXISTS` makes that a no-op once they are gone. Their indexes go with them.
+const RETIRED_TABLES: &[&str] = &[
+    "stats_daily",
+    "member_activity",
+    "channel_activity",
+    "hourly_activity",
+    "command_usage",
+    "ticket_messages",
+    "ticket_members",
+    "tickets",
+    "ticket_categories",
+    "ticket_config",
+    "starboard_entries",
+    "starboard_config",
+    "suggestion_votes",
+    "suggestions",
+    "confessions",
+    "invite_cache",
+    "invite_stats",
+    "scheduled_messages",
+    "workflow_queue",
+    "workflows",
+    "custom_commands",
+    "webhook_targets",
+    "weekly_reports",
+];
+
+/// Columns of removed features on tables that stay. SQLite has no
+/// `DROP COLUMN IF EXISTS`, so "no such column" on an already-cleaned
+/// database is expected and ignored.
+const RETIRED_COLUMNS: &[(&str, &str)] = &[
+    ("guild_config", "birthday_channel"),
+    ("guild_config", "birthday_role"),
+    ("profiles", "birthday"),
+    ("members", "inviter_id"),
+    ("members", "invite_code"),
+];
+
+/// Settings rows and counters that only removed features read.
+const RETIRED_ROWS: &[&str] = &[
+    "DELETE FROM kv_settings
+      WHERE key IN ('confession_channel', 'count_channel', 'count_template', 'suggestion_channel')",
+    // Counter names are `table.column`.
+    "DELETE FROM counters
+      WHERE name LIKE 'suggestions.%' OR name LIKE 'confessions.%' OR name LIKE 'tickets.%'",
+];
+
 /// Run the schema. Every statement is `IF NOT EXISTS`, so this is safe on each boot.
 async fn bootstrap(pool: &Db) -> anyhow::Result<()> {
-    for statement in SCHEMA.split(';') {
-        let trimmed = statement.trim();
-        // Skip fragments that are only comments / whitespace.
-        let is_blank = trimmed
-            .lines()
-            .map(str::trim)
-            .all(|l| l.is_empty() || l.starts_with("--"));
-        if is_blank {
-            continue;
-        }
-        sqlx::query(trimmed)
+    for statement in split_statements(SCHEMA) {
+        sqlx::query(&statement)
             .execute(pool)
             .await
-            .map_err(|e| anyhow::anyhow!("schema statement failed: {e}\n--- sql ---\n{trimmed}"))?;
+            .map_err(|e| anyhow::anyhow!("schema statement failed: {e}\n--- sql ---\n{statement}"))?;
     }
+
+    for statement in ADDITIVE_MIGRATIONS {
+        if let Err(why) = sqlx::query(statement).execute(pool).await {
+            let message = why.to_string();
+            if message.contains("duplicate column") {
+                continue;
+            }
+            return Err(anyhow::anyhow!("migration failed: {statement}: {why}"));
+        }
+    }
+
+    retire_removed_features(pool).await?;
+
     seed_trivia(pool).await?;
     seed_daily_questions(pool).await?;
     Ok(())
+}
+
+/// Delete the storage of features that no longer exist. Idempotent.
+async fn retire_removed_features(pool: &Db) -> anyhow::Result<()> {
+    for table in RETIRED_TABLES {
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not drop retired table {table}: {e}"))?;
+    }
+
+    for (table, column) in RETIRED_COLUMNS {
+        let sql = format!("ALTER TABLE {table} DROP COLUMN {column}");
+        if let Err(why) = sqlx::query(&sql).execute(pool).await {
+            if why.to_string().contains("no such column") {
+                continue;
+            }
+            return Err(anyhow::anyhow!("could not drop retired column {table}.{column}: {why}"));
+        }
+    }
+
+    for statement in RETIRED_ROWS {
+        sqlx::query(statement)
+            .execute(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not clear retired rows: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Split a SQL file into executable statements.
+///
+/// Naively splitting on `;` breaks the moment the schema gains a trigger or a
+/// string literal containing a semicolon, and it breaks silently - half a
+/// statement is still valid SQL often enough to be confusing. This tracks
+/// quoting and `BEGIN ... END` blocks instead.
+fn split_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut word = String::new();
+    let mut in_string = false;
+    let mut block_depth = 0usize;
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            current.push(ch);
+            if ch == '\'' {
+                // '' inside a string is an escaped quote, not the end of one.
+                if chars.peek() == Some(&'\'') {
+                    current.push('\'');
+                    chars.next();
+                } else {
+                    in_string = false;
+                }
+            }
+            continue;
+        }
+
+        // A `--` comment runs to the end of the line.
+        if ch == '-' && chars.peek() == Some(&'-') {
+            for c in chars.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+            }
+            flush_word(&mut word, &mut block_depth);
+            current.push('\n');
+            continue;
+        }
+
+        if ch == '\'' {
+            in_string = true;
+            current.push(ch);
+            continue;
+        }
+
+        if ch.is_alphanumeric() || ch == '_' {
+            word.push(ch.to_ascii_uppercase());
+            current.push(ch);
+            continue;
+        }
+
+        // Anything else ends the word we were reading.
+        flush_word(&mut word, &mut block_depth);
+
+        if ch == ';' && block_depth == 0 {
+            push_statement(&mut statements, &mut current);
+        } else {
+            current.push(ch);
+        }
+    }
+
+    flush_word(&mut word, &mut block_depth);
+    push_statement(&mut statements, &mut current);
+    statements
+}
+
+/// `BEGIN ... END` (a trigger body) and `CASE ... END` both nest, and the
+/// semicolons inside them belong to the enclosing statement.
+fn flush_word(word: &mut String, block_depth: &mut usize) {
+    match word.as_str() {
+        "BEGIN" | "CASE" => *block_depth += 1,
+        "END" => *block_depth = block_depth.saturating_sub(1),
+        _ => {}
+    }
+    word.clear();
+}
+
+fn push_statement(statements: &mut Vec<String>, current: &mut String) {
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        statements.push(trimmed.to_string());
+    }
+    current.clear();
 }
 
 // ===========================================================================
@@ -77,8 +257,6 @@ pub struct GuildConfig {
     pub mod_roles: String,
     pub admin_roles: String,
     pub staff_roles: String,
-    pub birthday_channel: Option<i64>,
-    pub birthday_role: Option<i64>,
     pub appeal_channel: Option<i64>,
     pub report_channel: Option<i64>,
     pub timezone: String,
@@ -159,19 +337,6 @@ pub struct LevelingConfig {
 }
 
 #[derive(Debug, Clone, FromRow)]
-pub struct TicketConfig {
-    pub guild_id: i64,
-    pub category_id: Option<i64>,
-    pub log_channel: Option<i64>,
-    pub transcript_channel: Option<i64>,
-    pub support_roles: String,
-    pub max_open: i64,
-    pub auto_close_hours: i64,
-    pub ask_feedback: i64,
-    pub next_number: i64,
-}
-
-#[derive(Debug, Clone, FromRow)]
 pub struct VoiceConfig {
     pub guild_id: i64,
     pub j2c_channel: Option<i64>,
@@ -184,31 +349,40 @@ pub struct VoiceConfig {
     pub empty_grace: i64,
 }
 
-#[derive(Debug, Clone, FromRow)]
-pub struct StarboardConfig {
-    pub guild_id: i64,
-    pub channel_id: Option<i64>,
-    pub threshold: i64,
-    pub emoji: String,
-    pub self_star: i64,
-    pub ignore_bots: i64,
-    pub nsfw_allowed: i64,
-}
-
 // ===========================================================================
 // Row bootstrapping + fetching
 // ===========================================================================
 
+/// The prefix a brand-new guild row starts with.
+///
+/// `BOT_PREFIX` is the process-wide default and `/config prefix` overrides it
+/// per guild. Now that the framework asks the guild row for its prefix, a new
+/// row has to be seeded with the configured default, or `BOT_PREFIX` would
+/// quietly stop applying anywhere but DMs.
+static DEFAULT_PREFIX: once_cell::sync::OnceCell<String> = once_cell::sync::OnceCell::new();
+
+/// Called once at startup, before any guild row is created.
+pub fn set_default_prefix(prefix: &str) {
+    let _ = DEFAULT_PREFIX.set(prefix.to_string());
+}
+
+fn default_prefix() -> &'static str {
+    DEFAULT_PREFIX.get().map(String::as_str).unwrap_or("!")
+}
+
 /// Insert the default row in every per-guild config table. Cheap and idempotent.
 pub async fn ensure_guild(db: &Db, guild_id: i64) -> anyhow::Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO guild_config (guild_id, prefix) VALUES (?, ?)")
+        .bind(guild_id)
+        .bind(default_prefix())
+        .execute(db)
+        .await?;
+
     for table in [
-        "guild_config",
         "automod_config",
         "welcome_config",
         "leveling_config",
-        "ticket_config",
         "voice_config",
-        "starboard_config",
     ] {
         let sql = format!("INSERT OR IGNORE INTO {table} (guild_id) VALUES (?)");
         sqlx::query(&sql).bind(guild_id).execute(db).await?;
@@ -216,33 +390,82 @@ pub async fn ensure_guild(db: &Db, guild_id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Caching
+//
+// These rows are read on the hot paths - every message asks for the guild,
+// leveling and automod settings - and written about once a month. Each read
+// goes through a short-lived cache, and every write goes through the setters
+// below, which drop the matching entry. A `/config` change is therefore visible
+// immediately; the TTL only covers rows edited some other way.
+// ---------------------------------------------------------------------------
+
+/// How long a cached config row may be served for.
+const CONFIG_TTL_SECS: u64 = 60;
+/// Enough for a large bot; over this the cache prunes itself.
+const CONFIG_CAPACITY: usize = 4096;
+
+fn config_cache<T: Clone>() -> TtlCache<i64, T> {
+    TtlCache::new(CONFIG_TTL_SECS, CONFIG_CAPACITY)
+}
+
+static GUILD_CACHE: Lazy<TtlCache<i64, GuildConfig>> = Lazy::new(config_cache);
+static AUTOMOD_CACHE: Lazy<TtlCache<i64, AutomodConfig>> = Lazy::new(config_cache);
+static WELCOME_CACHE: Lazy<TtlCache<i64, WelcomeConfig>> = Lazy::new(config_cache);
+static LEVELING_CACHE: Lazy<TtlCache<i64, LevelingConfig>> = Lazy::new(config_cache);
+static VOICE_CACHE: Lazy<TtlCache<i64, VoiceConfig>> = Lazy::new(config_cache);
+
 macro_rules! fetch_config {
-    ($name:ident, $ty:ty, $table:literal) => {
+    ($name:ident, $ty:ty, $table:literal, $cache:ident) => {
         pub async fn $name(db: &Db, guild_id: i64) -> anyhow::Result<$ty> {
+            if let Some(cached) = $cache.get(&guild_id) {
+                return Ok(cached);
+            }
+
             let sql = concat!("SELECT * FROM ", $table, " WHERE guild_id = ?");
-            if let Some(row) = sqlx::query_as::<_, $ty>(sql)
+            let row = match sqlx::query_as::<_, $ty>(sql)
                 .bind(guild_id)
                 .fetch_optional(db)
                 .await?
             {
-                return Ok(row);
-            }
-            ensure_guild(db, guild_id).await?;
-            Ok(sqlx::query_as::<_, $ty>(sql)
-                .bind(guild_id)
-                .fetch_one(db)
-                .await?)
+                Some(row) => row,
+                None => {
+                    ensure_guild(db, guild_id).await?;
+                    sqlx::query_as::<_, $ty>(sql)
+                        .bind(guild_id)
+                        .fetch_one(db)
+                        .await?
+                }
+            };
+
+            $cache.put(guild_id, row.clone());
+            Ok(row)
         }
     };
 }
 
-fetch_config!(guild_config, GuildConfig, "guild_config");
-fetch_config!(automod_config, AutomodConfig, "automod_config");
-fetch_config!(welcome_config, WelcomeConfig, "welcome_config");
-fetch_config!(leveling_config, LevelingConfig, "leveling_config");
-fetch_config!(ticket_config, TicketConfig, "ticket_config");
-fetch_config!(voice_config, VoiceConfig, "voice_config");
-fetch_config!(starboard_config, StarboardConfig, "starboard_config");
+fetch_config!(guild_config, GuildConfig, "guild_config", GUILD_CACHE);
+fetch_config!(automod_config, AutomodConfig, "automod_config", AUTOMOD_CACHE);
+fetch_config!(welcome_config, WelcomeConfig, "welcome_config", WELCOME_CACHE);
+fetch_config!(
+    leveling_config,
+    LevelingConfig,
+    "leveling_config",
+    LEVELING_CACHE
+);
+fetch_config!(voice_config, VoiceConfig, "voice_config", VOICE_CACHE);
+
+/// Forget the cached row for one config table, after writing to it.
+pub fn invalidate_config(table: &str, guild_id: i64) {
+    match table {
+        "guild_config" => GUILD_CACHE.invalidate(&guild_id),
+        "automod_config" => AUTOMOD_CACHE.invalidate(&guild_id),
+        "welcome_config" => WELCOME_CACHE.invalidate(&guild_id),
+        "leveling_config" => LEVELING_CACHE.invalidate(&guild_id),
+        "voice_config" => VOICE_CACHE.invalidate(&guild_id),
+        _ => {}
+    }
+}
 
 /// Update a single column in a per-guild config table.
 /// `table` and `column` are never user supplied — always literals from a command module.
@@ -262,6 +485,9 @@ macro_rules! setter {
                 .bind(guild_id)
                 .execute(db)
                 .await?;
+            // Drop the stale copy *after* the write lands, so a concurrent read
+            // cannot put it straight back.
+            invalidate_config(table, guild_id);
             Ok(())
         }
     };
@@ -289,19 +515,26 @@ pub async fn set_bool(
 // ===========================================================================
 
 pub async fn kv_get(db: &Db, guild_id: i64, key: &str) -> Option<String> {
-    sqlx::query_scalar::<_, String>("SELECT value FROM kv_settings WHERE guild_id = ? AND key = ?")
-        .bind(guild_id)
-        .bind(key)
-        .fetch_optional(db)
-        .await
-        .ok()
-        .flatten()
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM kv_settings
+         WHERE guild_id = ? AND key = ?
+           AND (expires_at IS NULL OR expires_at > ?)",
+    )
+    .bind(guild_id)
+    .bind(key)
+    .bind(crate::util::time::sql_now())
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
 }
 
 pub async fn kv_set(db: &Db, guild_id: i64, key: &str, value: &str) -> anyhow::Result<()> {
     sqlx::query(
-        "INSERT INTO kv_settings (guild_id, key, value) VALUES (?, ?, ?)
-         ON CONFLICT(guild_id, key) DO UPDATE SET value = excluded.value",
+        "INSERT INTO kv_settings (guild_id, key, value, expires_at) VALUES (?, ?, ?, NULL)
+         ON CONFLICT(guild_id, key) DO UPDATE SET
+            value = excluded.value,
+            expires_at = excluded.expires_at",
     )
     .bind(guild_id)
     .bind(key)
@@ -311,11 +544,33 @@ pub async fn kv_set(db: &Db, guild_id: i64, key: &str, value: &str) -> anyhow::R
     Ok(())
 }
 
-pub async fn kv_get_i64(db: &Db, guild_id: i64, key: &str, default: i64) -> i64 {
-    kv_get(db, guild_id, key)
-        .await
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+/// Store a value that stops being true after `ttl_secs`.
+///
+/// Used for the short-lived keys - an in-flight trivia answer, the record of
+/// who has answered it - so the sweep in [`crate::tasks`] can drop expired rows
+/// without taking live games with them.
+pub async fn kv_set_with_ttl(
+    db: &Db,
+    guild_id: i64,
+    key: &str,
+    value: &str,
+    ttl_secs: i64,
+) -> anyhow::Result<()> {
+    let expires_at =
+        crate::util::time::to_sql(chrono::Utc::now() + chrono::Duration::seconds(ttl_secs));
+    sqlx::query(
+        "INSERT INTO kv_settings (guild_id, key, value, expires_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(guild_id, key) DO UPDATE SET
+            value = excluded.value,
+            expires_at = excluded.expires_at",
+    )
+    .bind(guild_id)
+    .bind(key)
+    .bind(value)
+    .bind(expires_at)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 // ===========================================================================
@@ -336,11 +591,32 @@ pub fn ids_csv(ids: &[i64]) -> String {
         .join(",")
 }
 
-/// Next sequential number for a per-guild counter (cases, suggestions, quotes...).
+/// Next sequential number for a per-guild counter (cases, quotes...).
+///
+/// This is one statement on purpose. Reading `MAX(n) + 1` and then inserting is
+/// two steps, and two callers running at the same time - an automod burst, a
+/// raid cleanup, two moderators - get handed the same number. For `mod_cases`
+/// that meant the second insert hit the unique index *after* the ban had
+/// already been carried out.
+///
+/// The counter seeds itself from the rows that already exist, so an older
+/// database carries on where it left off.
 pub async fn next_number(db: &Db, table: &str, column: &str, guild_id: i64) -> anyhow::Result<i64> {
-    let sql = format!("SELECT COALESCE(MAX({column}), 0) + 1 FROM {table} WHERE guild_id = ?");
-    let n: i64 = sqlx::query_scalar(&sql).bind(guild_id).fetch_one(db).await?;
-    Ok(n)
+    // `table` and `column` are always literals from a command module.
+    let sql = format!(
+        "INSERT INTO counters (guild_id, name, value)
+         VALUES (?, ?, (SELECT COALESCE(MAX({column}), 0) + 1 FROM {table} WHERE guild_id = ?))
+         ON CONFLICT(guild_id, name) DO UPDATE SET value = value + 1
+         RETURNING value"
+    );
+
+    let value: i64 = sqlx::query_scalar(&sql)
+        .bind(guild_id)
+        .bind(format!("{table}.{column}"))
+        .bind(guild_id)
+        .fetch_one(db)
+        .await?;
+    Ok(value)
 }
 
 // ===========================================================================
@@ -458,4 +734,58 @@ async fn seed_daily_questions(db: &Db) -> anyhow::Result<()> {
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_plain_statements() {
+        let sql = "CREATE TABLE a (x INTEGER);\nCREATE TABLE b (y TEXT);";
+        let parts = split_statements(sql);
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].starts_with("CREATE TABLE a"));
+        assert!(parts[1].starts_with("CREATE TABLE b"));
+    }
+
+    #[test]
+    fn comments_and_blank_fragments_are_dropped() {
+        let sql = "-- a comment\nCREATE TABLE a (x INTEGER);\n\n-- trailing comment\n";
+        assert_eq!(split_statements(sql).len(), 1);
+    }
+
+    #[test]
+    fn semicolons_inside_strings_do_not_split() {
+        let sql = "INSERT INTO a (x) VALUES ('one; two');";
+        let parts = split_statements(sql);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert!(parts[0].contains("'one; two'"));
+    }
+
+    #[test]
+    fn trigger_bodies_stay_in_one_piece() {
+        let sql = "CREATE TRIGGER t AFTER INSERT ON a BEGIN \
+                   DELETE FROM b; UPDATE c SET d = 1; END;\
+                   \nCREATE TABLE e (f INTEGER);";
+        let parts = split_statements(sql);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts[0].contains("DELETE FROM b"));
+        assert!(parts[0].contains("UPDATE c"));
+        assert!(parts[1].starts_with("CREATE TABLE e"));
+    }
+
+    /// The real schema has to come out in one piece or the bot will not boot.
+    #[test]
+    fn the_shipped_schema_parses() {
+        let parts = split_statements(SCHEMA);
+        assert!(parts.len() > 40, "only got {} statements", parts.len());
+        for part in &parts {
+            let upper = part.to_uppercase();
+            assert!(
+                upper.starts_with("CREATE") || upper.starts_with("PRAGMA"),
+                "unexpected statement: {part}"
+            );
+        }
+    }
 }

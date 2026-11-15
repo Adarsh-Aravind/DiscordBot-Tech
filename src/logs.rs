@@ -71,22 +71,6 @@ pub async fn send(
     }
 }
 
-/// Same as [`send`] but also returns the message id, for logs we later edit.
-pub async fn send_tracked(
-    ctx: &serenity::Context,
-    db: &Db,
-    guild_id: i64,
-    kind: Log,
-    embed: CreateEmbed,
-) -> Option<u64> {
-    let channel = channel_for(db, guild_id, kind).await?;
-    channel
-        .send_message(&ctx.http, CreateMessage::new().embed(embed))
-        .await
-        .ok()
-        .map(|m| m.id.get())
-}
-
 /// Which column `/config log` should write for a given kind name.
 pub fn column_for_name(name: &str) -> Option<&'static str> {
     Some(match name {

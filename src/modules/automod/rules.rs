@@ -377,6 +377,7 @@ pub async fn automod_exempt(_ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Exempt a role, channel or member from automod.
 #[poise::command(slash_command, rename = "add", guild_only)]
 pub async fn exempt_add(
     ctx: Ctx<'_>,
@@ -401,6 +402,7 @@ pub async fn exempt_add(
             .bind(id as i64)
             .execute(&ctx.data().db)
             .await?;
+            super::invalidate(guild_id);
             added.push(match kind {
                 "role" => format!("{label} <@&{id}>"),
                 "channel" => format!("{label} <#{id}>"),
@@ -418,6 +420,7 @@ pub async fn exempt_add(
     Ok(())
 }
 
+/// Remove an automod exemption.
 #[poise::command(slash_command, rename = "remove", guild_only)]
 pub async fn exempt_remove(
     ctx: Ctx<'_>,
@@ -442,6 +445,7 @@ pub async fn exempt_remove(
             .bind(id as i64)
             .execute(&ctx.data().db)
             .await?;
+            super::invalidate(guild_id);
             removed += result.rows_affected();
         }
     }
@@ -453,6 +457,7 @@ pub async fn exempt_remove(
     Ok(())
 }
 
+/// Show everything automod ignores.
 #[poise::command(slash_command, rename = "list", guild_only)]
 pub async fn exempt_list(ctx: Ctx<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().unwrap().get() as i64;
@@ -519,6 +524,7 @@ pub async fn badword_add(
             .await?;
         added += result.rows_affected();
     }
+    super::invalidate(guild_id);
     ctx.send(
         poise::CreateReply::default()
             .embed(embed::ok(format!("Added **{added}** word(s) to the filter.")))
@@ -528,6 +534,7 @@ pub async fn badword_add(
     Ok(())
 }
 
+/// Take a word off the filter.
 #[poise::command(slash_command, rename = "remove", guild_only, ephemeral)]
 pub async fn badword_remove(
     ctx: Ctx<'_>,
@@ -540,6 +547,7 @@ pub async fn badword_remove(
         .bind(&normalised)
         .execute(&ctx.data().db)
         .await?;
+    super::invalidate(guild_id);
 
     let body = if result.rows_affected() == 0 {
         embed::err("That word is not in the filter.")
@@ -551,6 +559,7 @@ pub async fn badword_remove(
     Ok(())
 }
 
+/// Show the filtered words.
 #[poise::command(slash_command, rename = "list", guild_only, ephemeral)]
 pub async fn badword_list(ctx: Ctx<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().unwrap().get() as i64;
@@ -595,6 +604,7 @@ pub async fn allowlist(_ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Allow links to a domain. While the list has any entry, links elsewhere are deleted.
 #[poise::command(slash_command, rename = "add", guild_only)]
 pub async fn allowlist_add(
     ctx: Ctx<'_>,
@@ -622,6 +632,7 @@ pub async fn allowlist_add(
         .bind(&clean)
         .execute(&ctx.data().db)
         .await?;
+    super::invalidate(guild_id);
 
     ctx.send(poise::CreateReply::default().embed(embed::ok(format!(
         "`{clean}` is allowed. **Note:** while the allowlist has any entry, links to other domains are deleted."
@@ -630,6 +641,7 @@ pub async fn allowlist_add(
     Ok(())
 }
 
+/// Take a domain off the link allowlist.
 #[poise::command(slash_command, rename = "remove", guild_only)]
 pub async fn allowlist_remove(
     ctx: Ctx<'_>,
@@ -641,6 +653,7 @@ pub async fn allowlist_remove(
         .bind(domain.trim().to_lowercase())
         .execute(&ctx.data().db)
         .await?;
+    super::invalidate(guild_id);
     let body = if result.rows_affected() == 0 {
         embed::err("Not on the list.")
     } else {
@@ -650,6 +663,7 @@ pub async fn allowlist_remove(
     Ok(())
 }
 
+/// Show the link allowlist.
 #[poise::command(slash_command, rename = "list", guild_only)]
 pub async fn allowlist_list(ctx: Ctx<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().unwrap().get() as i64;
@@ -753,6 +767,7 @@ pub async fn rule(_ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Create or update a custom automod rule.
 #[poise::command(slash_command, rename = "add", guild_only)]
 pub async fn rule_add(
     ctx: Ctx<'_>,
@@ -814,6 +829,7 @@ pub async fn rule_add(
 
     match result {
         Ok(_) => {
+            super::invalidate(guild_id);
             ctx.send(poise::CreateReply::default().embed(embed::ok(format!(
                 "Rule **{}** saved: {} → {}.",
                 name.trim(),
@@ -833,6 +849,7 @@ pub async fn rule_add(
     Ok(())
 }
 
+/// Delete a custom rule.
 #[poise::command(slash_command, rename = "remove", guild_only)]
 pub async fn rule_remove(
     ctx: Ctx<'_>,
@@ -844,6 +861,7 @@ pub async fn rule_remove(
         .bind(name.trim())
         .execute(&ctx.data().db)
         .await?;
+    super::invalidate(guild_id);
     let body = if result.rows_affected() == 0 {
         embed::err("No rule with that name.")
     } else {
@@ -853,6 +871,7 @@ pub async fn rule_remove(
     Ok(())
 }
 
+/// Switch a custom rule on or off.
 #[poise::command(slash_command, rename = "toggle", guild_only)]
 pub async fn rule_toggle(
     ctx: Ctx<'_>,
@@ -866,6 +885,7 @@ pub async fn rule_toggle(
         .bind(name.trim())
         .execute(&ctx.data().db)
         .await?;
+    super::invalidate(guild_id);
     let body = if result.rows_affected() == 0 {
         embed::err("No rule with that name.")
     } else {
@@ -879,6 +899,7 @@ pub async fn rule_toggle(
     Ok(())
 }
 
+/// Show the custom rules and what they do.
 #[poise::command(slash_command, rename = "list", guild_only)]
 pub async fn rule_list(ctx: Ctx<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().unwrap().get() as i64;
@@ -931,7 +952,11 @@ pub async fn rule_test(
         let list = ctx.data().phish_domains.read();
         for domain in &domains {
             if list.contains(domain.as_str()) {
-                hits.push(format!("anti-phishing: `{domain}`"));
+                hits.push(format!("anti-phishing: `{domain}` is on the list → ban"));
+            } else if super::scan::looks_like_phish(domain) {
+                hits.push(format!(
+                    "anti-phishing: `{domain}` looks like impersonation → delete and alert"
+                ));
             }
         }
     }
@@ -950,7 +975,13 @@ pub async fn rule_test(
         .await?;
     let normalised = text::normalize_leet(&content);
     for word in words {
-        if text::contains_word(&normalised, &word) || normalised.contains(&word) {
+        // Same rule as the scanner: whole words, unless the entry is a phrase.
+        let matched = if word.contains(' ') {
+            normalised.contains(&word)
+        } else {
+            text::contains_word(&normalised, &word)
+        };
+        if matched {
             hits.push(format!("bad word: `{word}`"));
         }
     }

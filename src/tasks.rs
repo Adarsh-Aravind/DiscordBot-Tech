@@ -5,18 +5,19 @@ use std::time::Duration;
 
 use chrono::Utc;
 use poise::serenity_prelude as serenity;
-use serenity::{ChannelId, CreateMessage, GuildId, RoleId, UserId};
+use serenity::GuildId;
 
 use crate::db::Db;
-use crate::modules::{automation, community, leveling, moderation, tickets, voice};
+use crate::modules::{automation, community, leveling, moderation, voice};
 use crate::state::Data;
-use crate::util::{embed, time};
+use crate::util::time;
 
 /// Start every background loop. Called once the bot is ready.
 pub fn spawn_all(sctx: serenity::Context, data: Data) {
     spawn_loop("fast", 30, sctx.clone(), data.clone(), |sctx, data| async move {
         moderation::sweep_expired(&sctx, &data.db).await;
-        automation::run_scheduler(&sctx, &data).await;
+        automation::run_reminders(&sctx, &data).await;
+        voice::sweep_pending_deletes(&sctx, &data).await;
     });
 
     spawn_loop("minute", 60, sctx.clone(), data.clone(), |sctx, data| async move {
@@ -28,15 +29,12 @@ pub fn spawn_all(sctx: serenity::Context, data: Data) {
     spawn_loop("five-minute", 300, sctx.clone(), data.clone(), |sctx, data| async move {
         voice::tick_voice_xp(&sctx, &data).await;
         voice::sweep_afk(&sctx, &data).await;
-        tickets::auto_close_stale(&sctx, &data).await;
     });
 
     spawn_loop("hourly", 3600, sctx.clone(), data.clone(), |sctx, data| async move {
-        automation::run_weekly_reports(&sctx, &data).await;
-        automation::update_count_channels(&sctx, &data, &data.db).await;
         community::misc::sweep_challenges(&sctx, &data).await;
         prune_old_data(&data.db).await;
-        snapshot_guilds(&sctx, &data).await;
+        prune_memory(&data);
     });
 
     // The daily loop wakes every 15 minutes and acts once per UTC day.
@@ -88,24 +86,18 @@ async fn prune_old_data(db: &Db) {
         .execute(db)
         .await;
 
-    // Per-day member activity beyond a year is not used by any command.
-    let _ = sqlx::query("DELETE FROM member_activity WHERE day < ?")
-        .bind(time::day_offset(400))
-        .execute(db)
-        .await;
-    let _ = sqlx::query("DELETE FROM channel_activity WHERE day < ?")
-        .bind(time::day_offset(400))
-        .execute(db)
-        .await;
-
     // Closed voice sessions older than 90 days: the totals live on the member row.
     let _ = sqlx::query("DELETE FROM voice_sessions WHERE left_at IS NOT NULL AND left_at < ?")
         .bind(time::day_offset(90))
         .execute(db)
         .await;
 
-    // Expired trivia answer keys.
-    let _ = sqlx::query("DELETE FROM kv_settings WHERE key LIKE 'trivia.%'")
+    // Short-lived settings rows - in-flight trivia answers and the record of
+    // who has answered - once they are actually past their expiry. This used to
+    // be `DELETE ... WHERE key LIKE 'trivia.%'`, which ran on the hour and took
+    // every open question with it.
+    let _ = sqlx::query("DELETE FROM kv_settings WHERE expires_at IS NOT NULL AND expires_at <= ?")
+        .bind(time::sql_now())
         .execute(db)
         .await;
 
@@ -114,27 +106,42 @@ async fn prune_old_data(db: &Db) {
         .bind(time::day_offset(30))
         .execute(db)
         .await;
+
 }
 
-/// Record today's member count for every guild we can see.
-async fn snapshot_guilds(sctx: &serenity::Context, data: &Data) {
-    let guilds: Vec<GuildId> = sctx.cache.guilds();
-    for guild_id in guilds {
-        let count = guild_id
-            .to_guild_cached(&sctx.cache)
-            .map(|g| g.member_count as i64);
-        if let Some(count) = count {
-            crate::modules::analytics::snapshot_member_count(
-                &data.db,
-                guild_id.get() as i64,
-                count,
-            )
-            .await;
-        }
+/// Forget in-memory tracking for members and channels that have gone quiet.
+///
+/// The automod windows, the duplicate tracker and the snipe slots were only
+/// ever removed when a threshold tripped, so a long-running bot kept one entry
+/// per member it had ever seen. It also means `/snipe` stops being able to
+/// resurrect a message somebody deleted days ago.
+fn prune_memory(data: &Data) {
+    const QUIET: u64 = 900;
+    const NUKE_QUIET: u64 = 3600;
+    const SNIPE_HOURS: i64 = 24;
+    const DUPLICATE_QUIET: Duration = Duration::from_secs(900);
+
+    let before = data.spam.len() + data.duplicates.len() + data.snipes.len();
+
+    data.spam.retain(|_, window| window.count(QUIET) > 0);
+    data.flood.retain(|_, window| window.count(QUIET) > 0);
+    data.joins.retain(|_, window| window.count(QUIET) > 0);
+    data.nuke.retain(|_, window| window.count(NUKE_QUIET) > 0);
+    data.duplicates
+        .retain(|_, last| last.at.elapsed() < DUPLICATE_QUIET);
+    data.snipes
+        .retain(|_, snipe| (Utc::now() - snipe.at).num_hours() < SNIPE_HOURS);
+    data.edit_snipes
+        .retain(|_, snipe| (Utc::now() - snipe.at).num_hours() < SNIPE_HOURS);
+    data.raid_mode.retain(|_, until| *until > Utc::now());
+
+    let after = data.spam.len() + data.duplicates.len() + data.snipes.len();
+    if before != after {
+        tracing::debug!(dropped = before - after, "pruned in-memory tracking");
     }
 }
 
-/// Jobs that should happen once a day: birthdays, the daily question,
+/// Jobs that should happen once a day: the daily question,
 /// anniversaries and the achievement sweep.
 async fn run_daily(sctx: &serenity::Context, data: &Data) {
     let today = time::today();
@@ -156,101 +163,17 @@ async fn run_daily(sctx: &serenity::Context, data: &Data) {
     for guild_id in guilds {
         let guild_i64 = guild_id.get() as i64;
 
-        announce_birthdays(sctx, data, guild_id).await;
         community::games::post_daily_question(sctx, data, guild_i64, None).await;
         community::misc::check_anniversary(sctx, data, guild_id).await;
         refresh_achievements(data, guild_i64).await;
     }
 }
 
-/// Announce today's birthdays and hand out the birthday role.
-async fn announce_birthdays(sctx: &serenity::Context, data: &Data, guild_id: GuildId) {
-    let guild_i64 = guild_id.get() as i64;
-
-    let Ok(cfg) = crate::db::guild_config(&data.db, guild_i64).await else {
-        return;
-    };
-
-    let today = Utc::now();
-    use chrono::Datelike;
-    let key = format!("{:02}-{:02}", today.month(), today.day());
-
-    let birthday_people: Vec<i64> = sqlx::query_scalar(
-        "SELECT user_id FROM profiles WHERE guild_id = ? AND birthday = ?",
-    )
-    .bind(guild_i64)
-    .bind(&key)
-    .fetch_all(&data.db)
-    .await
-    .unwrap_or_default();
-
-    // Take yesterday's birthday role off everyone first.
-    if let Some(role_i64) = cfg.birthday_role {
-        let role = RoleId::new(role_i64 as u64);
-        let holders: Vec<UserId> = match guild_id.to_guild_cached(&sctx.cache) {
-            Some(guild) => guild
-                .members
-                .values()
-                .filter(|m| m.roles.contains(&role))
-                .map(|m| m.user.id)
-                .collect(),
-            None => Vec::new(),
-        };
-        for user_id in holders {
-            if !birthday_people.contains(&(user_id.get() as i64)) {
-                let _ = crate::compat::remove_role(&sctx.http, guild_id, user_id, role).await;
-            }
-        }
-    }
-
-    if birthday_people.is_empty() {
-        return;
-    }
-
-    // Give the role to today's birthday members.
-    if let Some(role_i64) = cfg.birthday_role {
-        for user_i64 in &birthday_people {
-            let _ = crate::compat::add_role(
-                &sctx.http,
-                guild_id,
-                UserId::new(*user_i64 as u64),
-                RoleId::new(role_i64 as u64),
-            )
-            .await;
-        }
-    }
-
-    let Some(channel_i64) = cfg.birthday_channel else {
-        return;
-    };
-
-    let mentions = birthday_people
-        .iter()
-        .map(|id| format!("<@{id}>"))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let body = if birthday_people.len() == 1 {
-        format!("🎉 Happy birthday {mentions}! Have a great one.")
-    } else {
-        format!("🎉 Happy birthday to {mentions}! Have a great one, all of you.")
-    };
-
-    let _ = ChannelId::new(channel_i64 as u64)
-        .send_message(
-            &sctx.http,
-            CreateMessage::new().content(mentions).embed(
-                embed::titled("🎂 Birthdays today", embed::BRAND).description(body),
-            ),
-        )
-        .await;
-}
-
 /// Re-check achievements for members who were active yesterday, so streak and
 /// voice badges land without waiting for a level-up.
 async fn refresh_achievements(data: &Data, guild_id: i64) {
     let recent: Vec<i64> = sqlx::query_scalar(
-        "SELECT DISTINCT user_id FROM member_activity WHERE guild_id = ? AND day >= ?",
+        "SELECT user_id FROM levels WHERE guild_id = ? AND last_active >= ?",
     )
     .bind(guild_id)
     .bind(time::day_offset(2))

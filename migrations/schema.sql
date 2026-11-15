@@ -17,8 +17,6 @@ CREATE TABLE IF NOT EXISTS guild_config (
     mod_roles         TEXT    NOT NULL DEFAULT '',
     admin_roles       TEXT    NOT NULL DEFAULT '',
     staff_roles       TEXT    NOT NULL DEFAULT '',
-    birthday_channel  INTEGER,
-    birthday_role     INTEGER,
     appeal_channel    INTEGER,
     report_channel    INTEGER,
     timezone          TEXT    NOT NULL DEFAULT 'UTC',
@@ -28,10 +26,24 @@ CREATE TABLE IF NOT EXISTS guild_config (
 
 -- Free-form settings for the long tail of toggles.
 CREATE TABLE IF NOT EXISTS kv_settings (
-    guild_id INTEGER NOT NULL,
-    key      TEXT    NOT NULL,
-    value    TEXT    NOT NULL,
+    guild_id   INTEGER NOT NULL,
+    key        TEXT    NOT NULL,
+    value      TEXT    NOT NULL,
+    -- When set, the row is rubbish after this instant. Used for the short lived
+    -- keys (in-flight trivia answers) so a sweep can drop the expired ones
+    -- without taking the live ones with them.
+    expires_at TEXT,
     PRIMARY KEY (guild_id, key)
+);
+
+-- Monotonic per-guild counters: case numbers, quote numbers and so on.
+-- Handing out a number is a single UPSERT ... RETURNING, so two concurrent
+-- callers can never be given the same one.
+CREATE TABLE IF NOT EXISTS counters (
+    guild_id INTEGER NOT NULL,
+    name     TEXT    NOT NULL,
+    value    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (guild_id, name)
 );
 
 -- ===========================================================================
@@ -228,28 +240,8 @@ CREATE TABLE IF NOT EXISTS members (
     last_join   TEXT    NOT NULL DEFAULT (datetime('now')),
     last_leave  TEXT,
     join_count  INTEGER NOT NULL DEFAULT 1,
-    inviter_id  INTEGER,
-    invite_code TEXT,
     last_seen   TEXT,
     verified    INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (guild_id, user_id)
-);
-
-CREATE TABLE IF NOT EXISTS invite_cache (
-    guild_id INTEGER NOT NULL,
-    code     TEXT    NOT NULL,
-    inviter  INTEGER NOT NULL DEFAULT 0,
-    uses     INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (guild_id, code)
-);
-
-CREATE TABLE IF NOT EXISTS invite_stats (
-    guild_id INTEGER NOT NULL,
-    user_id  INTEGER NOT NULL,
-    total    INTEGER NOT NULL DEFAULT 0,
-    departed INTEGER NOT NULL DEFAULT 0,
-    fake     INTEGER NOT NULL DEFAULT 0,
-    bonus    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (guild_id, user_id)
 );
 
@@ -260,7 +252,6 @@ CREATE TABLE IF NOT EXISTS profiles (
     color      TEXT    NOT NULL DEFAULT '#5865F2',
     banner_url TEXT,
     badge      TEXT    NOT NULL DEFAULT '',
-    birthday   TEXT,
     timezone   TEXT,
     pronouns   TEXT    NOT NULL DEFAULT '',
     favourite  TEXT    NOT NULL DEFAULT '',
@@ -339,76 +330,6 @@ CREATE TABLE IF NOT EXISTS achievements (
 );
 
 -- ===========================================================================
--- Tickets
--- ===========================================================================
-CREATE TABLE IF NOT EXISTS ticket_config (
-    guild_id           INTEGER PRIMARY KEY,
-    category_id        INTEGER,
-    log_channel        INTEGER,
-    transcript_channel INTEGER,
-    support_roles      TEXT    NOT NULL DEFAULT '',
-    max_open           INTEGER NOT NULL DEFAULT 2,
-    auto_close_hours   INTEGER NOT NULL DEFAULT 72,
-    ask_feedback       INTEGER NOT NULL DEFAULT 1,
-    next_number        INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS ticket_categories (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id      INTEGER NOT NULL,
-    key           TEXT    NOT NULL,
-    label         TEXT    NOT NULL,
-    emoji         TEXT    NOT NULL DEFAULT '',
-    description   TEXT    NOT NULL DEFAULT '',
-    template      TEXT    NOT NULL DEFAULT '',
-    support_roles TEXT    NOT NULL DEFAULT '',
-    category_id   INTEGER
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_tcat_key ON ticket_categories(guild_id, key);
-
-CREATE TABLE IF NOT EXISTS tickets (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id       INTEGER NOT NULL,
-    number         INTEGER NOT NULL,
-    channel_id     INTEGER NOT NULL,
-    user_id        INTEGER NOT NULL,
-    category       TEXT    NOT NULL DEFAULT 'general',
-    subject        TEXT    NOT NULL DEFAULT '',
-    priority       TEXT    NOT NULL DEFAULT 'normal',
-    status         TEXT    NOT NULL DEFAULT 'open',
-    claimed_by     INTEGER,
-    assigned_to    INTEGER,
-    created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
-    first_reply_at TEXT,
-    first_reply_by INTEGER,
-    last_activity  TEXT    NOT NULL DEFAULT (datetime('now')),
-    closed_at      TEXT,
-    closed_by      INTEGER,
-    close_reason   TEXT,
-    rating         INTEGER,
-    feedback       TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_tickets_guild ON tickets(guild_id, status);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_channel ON tickets(channel_id);
-
-CREATE TABLE IF NOT EXISTS ticket_members (
-    ticket_id INTEGER NOT NULL,
-    user_id   INTEGER NOT NULL,
-    PRIMARY KEY (ticket_id, user_id)
-);
-
-CREATE TABLE IF NOT EXISTS ticket_messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticket_id  INTEGER NOT NULL,
-    author_id  INTEGER NOT NULL,
-    author_tag TEXT    NOT NULL DEFAULT '',
-    is_staff   INTEGER NOT NULL DEFAULT 0,
-    content    TEXT    NOT NULL DEFAULT '',
-    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-CREATE INDEX IF NOT EXISTS idx_tmsg_ticket ON ticket_messages(ticket_id, id);
-
--- ===========================================================================
 -- Community engagement
 -- ===========================================================================
 CREATE TABLE IF NOT EXISTS polls (
@@ -433,27 +354,6 @@ CREATE TABLE IF NOT EXISTS poll_votes (
     PRIMARY KEY (poll_id, user_id, choice)
 );
 
-CREATE TABLE IF NOT EXISTS suggestions (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id   INTEGER NOT NULL,
-    number     INTEGER NOT NULL,
-    user_id    INTEGER NOT NULL,
-    content    TEXT    NOT NULL,
-    channel_id INTEGER NOT NULL,
-    message_id INTEGER,
-    status     TEXT    NOT NULL DEFAULT 'pending',
-    staff_note TEXT,
-    reviewer   INTEGER,
-    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sugg_no ON suggestions(guild_id, number);
-
-CREATE TABLE IF NOT EXISTS suggestion_votes (
-    suggestion_id INTEGER NOT NULL,
-    user_id       INTEGER NOT NULL,
-    vote          INTEGER NOT NULL,
-    PRIMARY KEY (suggestion_id, user_id)
-);
 
 CREATE TABLE IF NOT EXISTS giveaways (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -502,24 +402,6 @@ CREATE TABLE IF NOT EXISTS event_signups (
     PRIMARY KEY (event_id, user_id)
 );
 
-CREATE TABLE IF NOT EXISTS starboard_config (
-    guild_id     INTEGER PRIMARY KEY,
-    channel_id   INTEGER,
-    threshold    INTEGER NOT NULL DEFAULT 4,
-    emoji        TEXT    NOT NULL DEFAULT '⭐',
-    self_star    INTEGER NOT NULL DEFAULT 0,
-    ignore_bots  INTEGER NOT NULL DEFAULT 1,
-    nsfw_allowed INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS starboard_entries (
-    guild_id       INTEGER NOT NULL,
-    message_id     INTEGER NOT NULL,
-    star_message   INTEGER NOT NULL,
-    stars          INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (guild_id, message_id)
-);
-
 CREATE TABLE IF NOT EXISTS quotes (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id   INTEGER NOT NULL,
@@ -528,17 +410,6 @@ CREATE TABLE IF NOT EXISTS quotes (
     content    TEXT    NOT NULL,
     added_by   INTEGER NOT NULL,
     link       TEXT,
-    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS confessions (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id   INTEGER NOT NULL,
-    number     INTEGER NOT NULL,
-    user_id    INTEGER NOT NULL,
-    content    TEXT    NOT NULL,
-    message_id INTEGER,
-    banned     INTEGER NOT NULL DEFAULT 0,
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -674,79 +545,16 @@ CREATE INDEX IF NOT EXISTS idx_vs_user ON voice_sessions(guild_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_vs_open ON voice_sessions(guild_id, user_id, left_at);
 
 -- ===========================================================================
--- Analytics
+-- Bot metadata
 -- ===========================================================================
-CREATE TABLE IF NOT EXISTS stats_daily (
-    guild_id   INTEGER NOT NULL,
-    day        TEXT    NOT NULL,
-    messages   INTEGER NOT NULL DEFAULT 0,
-    joins      INTEGER NOT NULL DEFAULT 0,
-    leaves     INTEGER NOT NULL DEFAULT 0,
-    voice_secs INTEGER NOT NULL DEFAULT 0,
-    commands   INTEGER NOT NULL DEFAULT 0,
-    mod_actions INTEGER NOT NULL DEFAULT 0,
-    member_count INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (guild_id, day)
-);
-
-CREATE TABLE IF NOT EXISTS member_activity (
-    guild_id   INTEGER NOT NULL,
-    user_id    INTEGER NOT NULL,
-    day        TEXT    NOT NULL,
-    messages   INTEGER NOT NULL DEFAULT 0,
-    voice_secs INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (guild_id, user_id, day)
-);
-CREATE INDEX IF NOT EXISTS idx_ma_day ON member_activity(guild_id, day);
-
-CREATE TABLE IF NOT EXISTS channel_activity (
-    guild_id   INTEGER NOT NULL,
-    channel_id INTEGER NOT NULL,
-    day        TEXT    NOT NULL,
-    messages   INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (guild_id, channel_id, day)
-);
-
-CREATE TABLE IF NOT EXISTS hourly_activity (
-    guild_id INTEGER NOT NULL,
-    hour     INTEGER NOT NULL,
-    messages INTEGER NOT NULL DEFAULT 0,
-    voice    INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (guild_id, hour)
-);
-
-CREATE TABLE IF NOT EXISTS command_usage (
-    guild_id INTEGER NOT NULL,
-    command  TEXT    NOT NULL,
-    uses     INTEGER NOT NULL DEFAULT 0,
-    errors   INTEGER NOT NULL DEFAULT 0,
-    last_use TEXT,
-    PRIMARY KEY (guild_id, command)
-);
-
 CREATE TABLE IF NOT EXISTS bot_meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
 -- ===========================================================================
--- Automation / workflows
+-- Reminders
 -- ===========================================================================
-CREATE TABLE IF NOT EXISTS scheduled_messages (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id    INTEGER NOT NULL,
-    channel_id  INTEGER NOT NULL,
-    content     TEXT    NOT NULL,
-    as_embed    INTEGER NOT NULL DEFAULT 0,
-    title       TEXT,
-    next_run    TEXT    NOT NULL,
-    interval_secs INTEGER NOT NULL DEFAULT 0,
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    created_by  INTEGER NOT NULL,
-    runs        INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_sched_next ON scheduled_messages(enabled, next_run);
-
 CREATE TABLE IF NOT EXISTS reminders (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id   INTEGER NOT NULL DEFAULT 0,
@@ -760,58 +568,4 @@ CREATE TABLE IF NOT EXISTS reminders (
 );
 CREATE INDEX IF NOT EXISTS idx_rem_at ON reminders(remind_at);
 
-CREATE TABLE IF NOT EXISTS workflows (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id    INTEGER NOT NULL,
-    name        TEXT    NOT NULL,
-    trigger_kind TEXT   NOT NULL,
-    trigger_arg TEXT    NOT NULL DEFAULT '',
-    conditions  TEXT    NOT NULL DEFAULT '[]',
-    actions     TEXT    NOT NULL DEFAULT '[]',
-    delay_secs  INTEGER NOT NULL DEFAULT 0,
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    runs        INTEGER NOT NULL DEFAULT 0,
-    created_by  INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_name ON workflows(guild_id, name);
 
-CREATE TABLE IF NOT EXISTS workflow_queue (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    workflow_id INTEGER NOT NULL,
-    guild_id    INTEGER NOT NULL,
-    user_id     INTEGER NOT NULL DEFAULT 0,
-    channel_id  INTEGER NOT NULL DEFAULT 0,
-    context     TEXT    NOT NULL DEFAULT '{}',
-    run_at      TEXT    NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS custom_commands (
-    guild_id      INTEGER NOT NULL,
-    name          TEXT    NOT NULL,
-    response      TEXT    NOT NULL,
-    as_embed      INTEGER NOT NULL DEFAULT 0,
-    required_role INTEGER,
-    uses          INTEGER NOT NULL DEFAULT 0,
-    created_by    INTEGER NOT NULL,
-    created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (guild_id, name)
-);
-
-CREATE TABLE IF NOT EXISTS webhook_targets (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id INTEGER NOT NULL,
-    name     TEXT    NOT NULL,
-    url      TEXT    NOT NULL,
-    events   TEXT    NOT NULL DEFAULT '',
-    enabled  INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS weekly_reports (
-    guild_id   INTEGER PRIMARY KEY,
-    channel_id INTEGER NOT NULL,
-    weekday    INTEGER NOT NULL DEFAULT 1,
-    hour       INTEGER NOT NULL DEFAULT 12,
-    enabled    INTEGER NOT NULL DEFAULT 1,
-    last_sent  TEXT
-);

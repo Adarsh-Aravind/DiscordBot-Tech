@@ -2,13 +2,17 @@
 
 pub mod commands;
 
+use std::sync::Arc;
+
 use chrono::Utc;
+use once_cell::sync::Lazy;
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, CreateMessage, GuildId, Message, RoleId, UserId};
 
 use crate::compat;
 use crate::db::{self, Db, LevelingConfig};
 use crate::state::{Data, Error};
+use crate::util::cache::TtlCache;
 use crate::util::{embed, text};
 
 // ---------------------------------------------------------------------------
@@ -87,22 +91,21 @@ pub async fn handle_message(
 
     ensure_row(&data.db, guild_i64, user_i64).await?;
 
-    // Message count and activity always tick, even inside the XP cooldown.
-    sqlx::query(
-        "UPDATE levels SET messages = messages + 1 WHERE guild_id = ? AND user_id = ?",
+    // One read for everything this function needs to decide, instead of one
+    // read for the cooldown and another for the streak.
+    let (last_xp, last_active, streak, best_streak): (
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT last_xp, last_active, streak, best_streak FROM levels
+         WHERE guild_id = ? AND user_id = ?",
     )
     .bind(guild_i64)
     .bind(user_i64)
-    .execute(&data.db)
+    .fetch_one(&data.db)
     .await?;
-
-    let last_xp: Option<String> =
-        sqlx::query_scalar("SELECT last_xp FROM levels WHERE guild_id = ? AND user_id = ?")
-            .bind(guild_i64)
-            .bind(user_i64)
-            .fetch_optional(&data.db)
-            .await?
-            .flatten();
 
     let on_cooldown = last_xp
         .as_deref()
@@ -110,8 +113,18 @@ pub async fn handle_message(
         .map(|t| (Utc::now() - t).num_seconds() < cfg.cooldown)
         .unwrap_or(false);
 
-    // Daily streak is independent of the XP cooldown.
-    let streak_bonus = update_streak(&data.db, guild_i64, user_i64).await?;
+    // The message counter and the daily streak both tick regardless of the XP
+    // cooldown, and they go in the same statement so the common case - a
+    // message from someone who is still on cooldown - is a single write.
+    let streak_bonus = bump_activity(
+        &data.db,
+        guild_i64,
+        user_i64,
+        last_active.as_deref(),
+        streak,
+        best_streak,
+    )
+    .await?;
 
     if on_cooldown {
         return Ok(());
@@ -161,6 +174,110 @@ pub async fn ensure_row(db: &Db, guild_id: i64, user_id: i64) -> Result<(), Erro
     Ok(())
 }
 
+/// Apply an XP delta to an in-level total, rolling the level over or back.
+///
+/// `level` is not derivable from the lifetime total - prestige resets the level
+/// and deliberately keeps the total - so it is always carried forward from what
+/// the row already said.
+fn roll_level(mut xp: i64, mut level: i64) -> (i64, i64) {
+    while xp >= xp_to_next(level) {
+        xp -= xp_to_next(level);
+        level += 1;
+        if level > 1_000 {
+            break;
+        }
+    }
+    // Negative adjustments can push someone back down a level.
+    while xp < 0 && level > 0 {
+        level -= 1;
+        xp += xp_to_next(level);
+    }
+    if xp < 0 {
+        xp = 0;
+    }
+    (xp, level)
+}
+
+/// Take XP off a member, but only if they still have it.
+///
+/// The balance check and the write are one compare-and-set, so two commands
+/// running at the same moment cannot both spend the same XP. Returns false when
+/// the balance was not there.
+pub async fn try_spend_xp(
+    db: &Db,
+    guild_id: i64,
+    user_id: i64,
+    amount: i64,
+) -> Result<bool, Error> {
+    if amount <= 0 {
+        return Ok(false);
+    }
+    ensure_row(db, guild_id, user_id).await?;
+
+    for _ in 0..5 {
+        let (read_xp, read_level, read_total): (i64, i64, i64) = sqlx::query_as(
+            "SELECT xp, level, total_xp FROM levels WHERE guild_id = ? AND user_id = ?",
+        )
+        .bind(guild_id)
+        .bind(user_id)
+        .fetch_one(db)
+        .await?;
+
+        if read_total < amount {
+            return Ok(false);
+        }
+
+        let (xp, level) = roll_level(read_xp - amount, read_level);
+
+        let affected = sqlx::query(
+            "UPDATE levels SET xp = ?, level = ?, total_xp = ?
+             WHERE guild_id = ? AND user_id = ? AND xp = ? AND total_xp = ?",
+        )
+        .bind(xp)
+        .bind(level)
+        .bind(read_total - amount)
+        .bind(guild_id)
+        .bind(user_id)
+        .bind(read_xp)
+        .bind(read_total)
+        .execute(db)
+        .await?
+        .rows_affected();
+
+        if affected == 1 {
+            return Ok(true);
+        }
+        // Somebody else wrote first; look again at what they left.
+    }
+
+    Ok(false)
+}
+
+/// Cached multiplier rows. They are read for every message and written perhaps
+/// twice a year; [`invalidate_multipliers`] drops the entry when they change.
+static MULTIPLIER_CACHE: Lazy<TtlCache<i64, Arc<Vec<(String, i64, f64)>>>> =
+    Lazy::new(|| TtlCache::new(300, 2048));
+
+/// Forget the cached XP multipliers for a guild.
+pub fn invalidate_multipliers(guild_id: i64) {
+    MULTIPLIER_CACHE.invalidate(&guild_id);
+}
+
+async fn multipliers(db: &Db, guild_id: i64) -> Arc<Vec<(String, i64, f64)>> {
+    if let Some(hit) = MULTIPLIER_CACHE.get(&guild_id) {
+        return hit;
+    }
+    let rows: Vec<(String, i64, f64)> =
+        sqlx::query_as("SELECT kind, target_id, multiplier FROM xp_multipliers WHERE guild_id = ?")
+            .bind(guild_id)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+    let rows = Arc::new(rows);
+    MULTIPLIER_CACHE.put(guild_id, Arc::clone(&rows));
+    rows
+}
+
 /// Highest applicable role multiplier times the channel multiplier times the
 /// server-wide rate.
 async fn resolve_multiplier(
@@ -170,53 +287,51 @@ async fn resolve_multiplier(
     roles: &[i64],
     global_rate: f64,
 ) -> f64 {
-    let rows: Vec<(String, i64, f64)> =
-        sqlx::query_as("SELECT kind, target_id, multiplier FROM xp_multipliers WHERE guild_id = ?")
-            .bind(guild_id)
-            .fetch_all(db)
-            .await
-            .unwrap_or_default();
+    let rows = multipliers(db, guild_id).await;
 
     let mut role_mult: f64 = 1.0;
     let mut channel_mult: f64 = 1.0;
-    for (kind, target, multiplier) in rows {
+    for (kind, target, multiplier) in rows.iter() {
         match kind.as_str() {
-            "role" if roles.contains(&target) => role_mult = role_mult.max(multiplier),
-            "channel" if target == channel_id => channel_mult = multiplier,
+            "role" if roles.contains(target) => role_mult = role_mult.max(*multiplier),
+            "channel" if *target == channel_id => channel_mult = *multiplier,
             _ => {}
         }
     }
     (global_rate.max(0.0) * role_mult * channel_mult).clamp(0.0, 20.0)
 }
 
-/// Maintain the daily activity streak. Returns a small XP bonus for long runs.
-async fn update_streak(db: &Db, guild_id: i64, user_id: i64) -> Result<i64, Error> {
+/// Count the message and maintain the daily activity streak, in one statement.
+/// Returns the small XP bonus a long run earns.
+async fn bump_activity(
+    db: &Db,
+    guild_id: i64,
+    user_id: i64,
+    last_active: Option<&str>,
+    streak: i64,
+    best_streak: i64,
+) -> Result<i64, Error> {
     let today = Utc::now().format("%Y-%m-%d").to_string();
     let yesterday = (Utc::now() - chrono::Duration::days(1))
         .format("%Y-%m-%d")
         .to_string();
 
-    let row: Option<(Option<String>, i64, i64)> = sqlx::query_as(
-        "SELECT last_active, streak, best_streak FROM levels WHERE guild_id = ? AND user_id = ?",
-    )
-    .bind(guild_id)
-    .bind(user_id)
-    .fetch_optional(db)
-    .await?;
-
-    let (last_active, streak, best) = row.unwrap_or((None, 0, 0));
     let last = last_active.unwrap_or_default();
-
-    if last == today {
-        return Ok(streak_bonus(streak));
-    }
-
-    let new_streak = if last == yesterday { streak + 1 } else { 1 };
-    let new_best = best.max(new_streak);
+    let (new_streak, new_best) = if last == today {
+        (streak, best_streak)
+    } else if last == yesterday {
+        (streak + 1, best_streak.max(streak + 1))
+    } else {
+        (1, best_streak.max(1))
+    };
 
     sqlx::query(
-        "UPDATE levels SET last_active = ?, streak = ?, best_streak = ?
-         WHERE guild_id = ? AND user_id = ?",
+        "UPDATE levels
+            SET messages = messages + 1,
+                last_active = ?,
+                streak = ?,
+                best_streak = ?
+          WHERE guild_id = ? AND user_id = ?",
     )
     .bind(&today)
     .bind(new_streak)
@@ -239,6 +354,11 @@ fn streak_bonus(streak: i64) -> i64 {
 }
 
 /// Add XP, roll over levels, and report a level-up if one happened.
+///
+/// The write is a compare-and-set: the `UPDATE` only lands if the row still
+/// holds the values we based the new ones on. A plain read-then-write loses an
+/// award whenever two land together - two messages in flight, or a message and
+/// the voice-XP tick - because the second write overwrites the first.
 pub async fn add_xp(
     db: &Db,
     guild_id: i64,
@@ -247,46 +367,58 @@ pub async fn add_xp(
 ) -> Result<Option<LevelUp>, Error> {
     ensure_row(db, guild_id, user_id).await?;
 
-    let (mut xp, mut level, total): (i64, i64, i64) = sqlx::query_as(
-        "SELECT xp, level, total_xp FROM levels WHERE guild_id = ? AND user_id = ?",
-    )
-    .bind(guild_id)
-    .bind(user_id)
-    .fetch_one(db)
-    .await?;
+    const ATTEMPTS: usize = 5;
+    let mut level = 0i64;
+    let mut start_level = 0i64;
+    let mut committed = false;
 
-    xp += amount;
-    let new_total = (total + amount).max(0);
-    let start_level = level;
+    for _ in 0..ATTEMPTS {
+        let (read_xp, read_level, read_total): (i64, i64, i64) = sqlx::query_as(
+            "SELECT xp, level, total_xp FROM levels WHERE guild_id = ? AND user_id = ?",
+        )
+        .bind(guild_id)
+        .bind(user_id)
+        .fetch_one(db)
+        .await?;
 
-    while xp >= xp_to_next(level) {
-        xp -= xp_to_next(level);
-        level += 1;
-        if level > 1_000 {
+        let new_total = (read_total + amount).max(0);
+        start_level = read_level;
+
+        let (xp, new_level) = roll_level(read_xp + amount, read_level);
+        level = new_level;
+
+        let affected = sqlx::query(
+            "UPDATE levels SET xp = ?, level = ?, total_xp = ?, last_xp = ?
+             WHERE guild_id = ? AND user_id = ? AND xp = ? AND total_xp = ?",
+        )
+        .bind(xp)
+        .bind(level)
+        .bind(new_total)
+        .bind(crate::util::time::sql_now())
+        .bind(guild_id)
+        .bind(user_id)
+        .bind(read_xp)
+        .bind(read_total)
+        .execute(db)
+        .await?
+        .rows_affected();
+
+        if affected == 1 {
+            committed = true;
             break;
         }
-    }
-    // Negative adjustments can push someone back down a level.
-    while xp < 0 && level > 0 {
-        level -= 1;
-        xp += xp_to_next(level);
-    }
-    if xp < 0 {
-        xp = 0;
+        // Somebody else got there first; read the new values and redo the sum.
     }
 
-    sqlx::query(
-        "UPDATE levels SET xp = ?, level = ?, total_xp = ?, last_xp = ?
-         WHERE guild_id = ? AND user_id = ?",
-    )
-    .bind(xp)
-    .bind(level)
-    .bind(new_total)
-    .bind(crate::util::time::sql_now())
-    .bind(guild_id)
-    .bind(user_id)
-    .execute(db)
-    .await?;
+    if !committed {
+        tracing::warn!(
+            guild = guild_id,
+            user = user_id,
+            amount,
+            "gave up adding XP after {ATTEMPTS} attempts under contention"
+        );
+        return Ok(None);
+    }
 
     if level <= start_level {
         return Ok(None);
@@ -443,8 +575,6 @@ pub async fn award_voice(
         .execute(&data.db)
         .await?;
 
-    crate::modules::analytics::record_voice(&data.db, guild_i64, user_i64, seconds).await;
-
     if cfg.enabled == 0 || cfg.voice_enabled == 0 || cfg.voice_xp_per_min <= 0 {
         return Ok(());
     }
@@ -478,6 +608,8 @@ pub const ACHIEVEMENTS: &[(&str, &str)] = &[
     ("streak_7", "🔥 Week Streak"),
     ("streak_30", "🏆 Month Streak"),
     ("trivia_buff", "🧠 Trivia Buff"),
+    // No longer awarded (it counted closed tickets); kept so badges already
+    // earned still show their name.
     ("helper", "🤝 Helper"),
 ];
 
@@ -517,15 +649,6 @@ pub async fn check_achievements(db: &Db, guild_id: i64, user_id: i64) -> Vec<Str
     .flatten()
     .unwrap_or(0);
 
-    let closed_tickets: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM tickets WHERE guild_id = ? AND claimed_by = ? AND status = 'closed'",
-    )
-    .bind(guild_id)
-    .bind(user_id)
-    .fetch_one(db)
-    .await
-    .unwrap_or(0);
-
     let candidates: Vec<(&str, bool)> = vec![
         ("first_steps", messages >= 1),
         ("level_10", level >= 10),
@@ -538,7 +661,6 @@ pub async fn check_achievements(db: &Db, guild_id: i64, user_id: i64) -> Vec<Str
         ("streak_7", best_streak >= 7),
         ("streak_30", best_streak >= 30),
         ("trivia_buff", trivia >= 50),
-        ("helper", closed_tickets >= 25),
     ];
 
     let mut earned = Vec::new();

@@ -154,11 +154,19 @@ pub struct PunishOutcome {
 pub async fn punish(
     sctx: &serenity::Context,
     data: &Data,
-    req: PunishRequest,
+    mut req: PunishRequest,
 ) -> Result<PunishOutcome, Error> {
     let guild_i64 = req.guild_id.get() as i64;
     let http = &sctx.http;
     let guild_name = guild_name(sctx, req.guild_id);
+
+    // Clamp once, here, so the duration we apply is the duration we store and
+    // the one we tell the member about. Discord's own ceiling for a timeout is
+    // 28 days; a case that claimed 60 days would have left `expires_at` months
+    // after the member could actually talk again.
+    if req.action == Action::Timeout {
+        req.duration = Some(req.duration.unwrap_or(600).clamp(60, 28 * 86_400));
+    }
 
     let case_no = db::next_number(&data.db, "mod_cases", "case_no", guild_i64).await?;
 
@@ -176,7 +184,7 @@ pub async fn punish(
     match req.action {
         Action::Note | Action::Warn => {}
         Action::Timeout => {
-            let secs = req.duration.unwrap_or(600).clamp(60, 28 * 86_400);
+            let secs = req.duration.unwrap_or(600);
             compat::timeout_until(
                 http,
                 req.guild_id,
@@ -219,7 +227,11 @@ pub async fn punish(
     }
 
     // ---- record ----------------------------------------------------------
-    sqlx::query(
+    // The action above has already happened. If writing the case fails we have
+    // a punished member and no record of it, which is bad - but telling the
+    // moderator "that did not work" would be worse, because they would try
+    // again. Shout in the log and carry on.
+    let recorded = sqlx::query(
         "INSERT INTO mod_cases
             (guild_id, case_no, action, target_id, target_tag, mod_id, mod_tag,
              reason, duration, expires_at, active, automated, created_at)
@@ -238,7 +250,17 @@ pub async fn punish(
     .bind(i64::from(req.automated))
     .bind(time::sql_now())
     .execute(&data.db)
-    .await?;
+    .await;
+
+    if let Err(why) = recorded {
+        tracing::error!(
+            guild = guild_i64,
+            case = case_no,
+            target = req.target.get(),
+            action = req.action.as_str(),
+            "the punishment was carried out but the case could not be recorded: {why}"
+        );
+    }
 
     // Reversals close the matching open case.
     if matches!(req.action, Action::Untimeout | Action::Unban) {
@@ -257,8 +279,6 @@ pub async fn punish(
         .execute(&data.db)
         .await?;
     }
-
-    crate::modules::analytics::bump_daily(&data.db, guild_i64, "mod_actions", 1).await;
 
     // DM after the fact for actions that keep the member around.
     if !req.silent && !req.action.dm_before() {
@@ -423,6 +443,18 @@ async fn escalate(
     let Some(action) = Action::from_name(&action_raw) else {
         return Ok(None);
     };
+
+    // Escalating a warning into another warning would raise the active warning
+    // count and re-enter this function, walking up the whole ladder from one
+    // `/warn`. A rule like that is a configuration mistake, not an instruction.
+    if matches!(action, Action::Warn | Action::Note) {
+        tracing::warn!(
+            guild = guild_i64,
+            warns,
+            "ignoring an escalation rule that escalates a warning into another warning"
+        );
+        return Ok(None);
+    }
 
     let follow_up = PunishRequest {
         guild_id: req.guild_id,

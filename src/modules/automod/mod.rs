@@ -1,25 +1,26 @@
 //! Automod: message scanning, raid detection, nuke protection and the rules UI.
 //!
-//! `scan::handle_message` is called for every guild message. It returns at most
+//! `scan::handle_message` is called for every guild message. It finds at most
 //! one [`Violation`], which is then enforced in one place so punishment,
-//! deletion and alerting always stay consistent.
+//! deletion and alerting always stay consistent, and reports back whether the
+//! message survived.
 
 pub mod nuke;
 pub mod raid;
 pub mod rules;
 pub mod scan;
 
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
-use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use poise::serenity_prelude as serenity;
-use serenity::{GuildId, Message, UserId};
+use serenity::{GuildId, Message, RoleId, UserId};
 
 use crate::db::{self, AutomodConfig, Db};
 use crate::logs::{self, Log};
 use crate::modules::moderation::{self, Action, PunishRequest};
 use crate::state::{Data, Error};
+use crate::util::cache::TtlCache;
 use crate::util::{embed, text};
 
 /// What a check found.
@@ -79,26 +80,107 @@ impl Violation {
 }
 
 // ---------------------------------------------------------------------------
-// Config cache: automod reads config on every message, so hold it briefly.
+// Per-guild state cache
 // ---------------------------------------------------------------------------
 
-static CONFIG_CACHE: Lazy<DashMap<i64, (AutomodConfig, Instant)>> = Lazy::new(DashMap::new);
-const CACHE_TTL: Duration = Duration::from_secs(30);
-
-pub async fn config(db: &Db, guild_id: i64) -> Option<AutomodConfig> {
-    if let Some(entry) = CONFIG_CACHE.get(&guild_id) {
-        if entry.1.elapsed() < CACHE_TTL {
-            return Some(entry.0.clone());
-        }
-    }
-    let fresh = db::automod_config(db, guild_id).await.ok()?;
-    CONFIG_CACHE.insert(guild_id, (fresh.clone(), Instant::now()));
-    Some(fresh)
+/// One row of `automod_rules`, as the scanner needs it.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct Rule {
+    pub name: String,
+    pub trigger_kind: String,
+    pub pattern: String,
+    pub action: String,
+    pub duration: Option<i64>,
 }
 
-/// Drop the cached config after a settings change so it takes effect at once.
+/// Everything automod needs in order to judge one message.
+///
+/// Reading this used to be six separate queries per message - settings, bad
+/// words, custom rules, two exemption lookups and the link allowlist. It is now
+/// one bundle behind a short TTL, dropped by [`invalidate`] whenever any automod
+/// command changes something, so edits still take effect immediately.
+#[derive(Clone, Debug)]
+pub struct AutomodState {
+    pub cfg: AutomodConfig,
+    pub badwords: Vec<String>,
+    pub rules: Vec<Rule>,
+    pub exempt_roles: Vec<i64>,
+    pub exempt_users: Vec<i64>,
+    pub exempt_channels: Vec<i64>,
+    pub allowlist: Vec<String>,
+}
+
+static STATE_CACHE: Lazy<TtlCache<i64, Arc<AutomodState>>> = Lazy::new(|| TtlCache::new(30, 2048));
+
+pub async fn state(db: &Db, guild_id: i64) -> Option<Arc<AutomodState>> {
+    if let Some(hit) = STATE_CACHE.get(&guild_id) {
+        return Some(hit);
+    }
+
+    let cfg = db::automod_config(db, guild_id).await.ok()?;
+
+    let badwords: Vec<String> = sqlx::query_scalar("SELECT word FROM badwords WHERE guild_id = ?")
+        .bind(guild_id)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+
+    let rules: Vec<Rule> = sqlx::query_as(
+        "SELECT name, trigger_kind, pattern, action, duration FROM automod_rules
+         WHERE guild_id = ? AND enabled = 1 ORDER BY id",
+    )
+    .bind(guild_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let exemptions: Vec<(String, i64)> =
+        sqlx::query_as("SELECT kind, target FROM automod_exempt WHERE guild_id = ?")
+            .bind(guild_id)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+
+    let allowlist: Vec<String> =
+        sqlx::query_scalar("SELECT domain FROM link_allowlist WHERE guild_id = ?")
+            .bind(guild_id)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
+
+    let mut exempt_roles = Vec::new();
+    let mut exempt_users = Vec::new();
+    let mut exempt_channels = Vec::new();
+    for (kind, target) in exemptions {
+        match kind.as_str() {
+            "role" => exempt_roles.push(target),
+            "user" => exempt_users.push(target),
+            "channel" => exempt_channels.push(target),
+            _ => {}
+        }
+    }
+
+    let state = Arc::new(AutomodState {
+        cfg,
+        badwords,
+        rules,
+        exempt_roles,
+        exempt_users,
+        exempt_channels,
+        allowlist,
+    });
+    STATE_CACHE.put(guild_id, Arc::clone(&state));
+    Some(state)
+}
+
+/// Just the settings, for the callers that do not scan messages.
+pub async fn config(db: &Db, guild_id: i64) -> Option<AutomodConfig> {
+    state(db, guild_id).await.map(|s| s.cfg.clone())
+}
+
+/// Drop the cached state after a settings change so it takes effect at once.
 pub fn invalidate(guild_id: i64) {
-    CONFIG_CACHE.remove(&guild_id);
+    STATE_CACHE.invalidate(&guild_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +193,7 @@ pub async fn is_exempt(
     data: &Data,
     guild_id: GuildId,
     message: &Message,
+    state: &AutomodState,
 ) -> bool {
     let guild_i64 = guild_id.get() as i64;
     let author = message.author.id;
@@ -121,48 +204,42 @@ pub async fn is_exempt(
     if crate::util::perms::guild_owner(sctx, guild_id) == Some(author) {
         return true;
     }
+    if state.exempt_users.contains(&(author.get() as i64)) {
+        return true;
+    }
+    if state
+        .exempt_channels
+        .contains(&(message.channel_id.get() as i64))
+    {
+        return true;
+    }
 
-    // Anyone who can manage messages is treated as staff.
-    if let Some(member) = &message.member {
-        let role_ids: Vec<i64> = member.roles.iter().map(|r| r.get() as i64).collect();
-        if let Ok(cfg) = db::guild_config(&data.db, guild_i64).await {
-            let staff: Vec<i64> = db::csv_ids(&cfg.mod_roles)
-                .into_iter()
-                .chain(db::csv_ids(&cfg.admin_roles))
-                .chain(db::csv_ids(&cfg.staff_roles))
-                .collect();
-            if role_ids.iter().any(|r| staff.contains(r)) {
-                return true;
-            }
-        }
-
-        let exempt_roles: Vec<i64> = sqlx::query_scalar(
-            "SELECT target FROM automod_exempt WHERE guild_id = ? AND kind = 'role'",
-        )
-        .bind(guild_i64)
-        .fetch_all(&data.db)
-        .await
+    let roles: Vec<RoleId> = message
+        .member
+        .as_ref()
+        .map(|m| m.roles.clone())
         .unwrap_or_default();
-        if role_ids.iter().any(|r| exempt_roles.contains(r)) {
+    let role_ids: Vec<i64> = roles.iter().map(|r| r.get() as i64).collect();
+
+    if role_ids.iter().any(|r| state.exempt_roles.contains(r)) {
+        return true;
+    }
+
+    if let Ok(cfg) = db::guild_config(&data.db, guild_i64).await {
+        let staff: Vec<i64> = db::csv_ids(&cfg.mod_roles)
+            .into_iter()
+            .chain(db::csv_ids(&cfg.admin_roles))
+            .chain(db::csv_ids(&cfg.staff_roles))
+            .collect();
+        if role_ids.iter().any(|r| staff.contains(r)) {
             return true;
         }
     }
 
-    let exempt_rows: Vec<(String, i64)> =
-        sqlx::query_as("SELECT kind, target FROM automod_exempt WHERE guild_id = ?")
-            .bind(guild_i64)
-            .fetch_all(&data.db)
-            .await
-            .unwrap_or_default();
-
-    for (kind, target) in exempt_rows {
-        match kind.as_str() {
-            "user" if target == author.get() as i64 => return true,
-            "channel" if target == message.channel_id.get() as i64 => return true,
-            _ => {}
-        }
-    }
-    false
+    // A moderator who holds the Discord permission but was never given one of
+    // the configured roles is still staff. Without this, automod punishes the
+    // people who are meant to be running it.
+    crate::util::perms::roles_are_staff(sctx, guild_id, &roles)
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +247,10 @@ pub async fn is_exempt(
 // ---------------------------------------------------------------------------
 
 /// Apply a violation: delete the message, punish, alert.
+///
+/// Returns true when the message (or its author) is gone, so the rest of the
+/// message pipeline - XP, custom commands, games - can stop rather than reward
+/// someone for a message automod just removed.
 pub async fn enforce(
     sctx: &serenity::Context,
     data: &Data,
@@ -177,14 +258,22 @@ pub async fn enforce(
     message: &Message,
     violation: Violation,
     cfg: &AutomodConfig,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     let guild_i64 = guild_id.get() as i64;
+    let mut removed = false;
 
     if violation.delete && cfg.delete_violations == 1 {
-        let _ = message
-            .channel_id
-            .delete_message(&sctx.http, message.id, Some("Automod"))
-            .await;
+        removed = crate::compat::delete_message(&sctx.http, message.channel_id, message.id, Some("Automod"))
+            .await
+            .is_ok();
+    }
+
+    // Anything that takes the member out of the server counts as removed too.
+    if matches!(
+        violation.action,
+        Some(Action::Kick) | Some(Action::Ban) | Some(Action::Softban)
+    ) {
+        removed = true;
     }
 
     let mut case_line = String::new();
@@ -262,7 +351,7 @@ pub async fn enforce(
         logs::send(sctx, &data.db, guild_i64, Log::Mod, alert).await;
     }
 
-    Ok(())
+    Ok(removed)
 }
 
 pub fn commands() -> Vec<poise::Command<Data, Error>> {

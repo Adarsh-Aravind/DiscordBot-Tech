@@ -396,15 +396,17 @@ pub async fn xptransfer(
         return Ok(());
     }
 
-    ensure_row(&ctx.data().db, guild_id, sender).await?;
-    let available: i64 =
-        sqlx::query_scalar("SELECT total_xp FROM levels WHERE guild_id = ? AND user_id = ?")
-            .bind(guild_id)
-            .bind(sender)
-            .fetch_one(&ctx.data().db)
-            .await?;
-
-    if available < amount {
+    // Debit first, in one statement that both checks the balance and takes the
+    // XP. Checking and then writing let two quick invocations spend the same
+    // XP twice, and a failure half way through destroyed it.
+    if !super::try_spend_xp(&ctx.data().db, guild_id, sender, amount).await? {
+        let available: i64 =
+            sqlx::query_scalar("SELECT total_xp FROM levels WHERE guild_id = ? AND user_id = ?")
+                .bind(guild_id)
+                .bind(sender)
+                .fetch_optional(&ctx.data().db)
+                .await?
+                .unwrap_or(0);
         ctx.send(poise::CreateReply::default().embed(embed::err(format!(
             "You only have **{}** XP.",
             thousands(available)
@@ -413,19 +415,33 @@ pub async fn xptransfer(
         return Ok(());
     }
 
-    add_xp(&ctx.data().db, guild_id, sender, -amount).await?;
-    if let Some(levelup) = add_xp(&ctx.data().db, guild_id, receiver, amount).await? {
-        let cfg = db::leveling_config(&ctx.data().db, guild_id).await?;
-        super::apply_levelup(
-            ctx.serenity_context(),
-            ctx.data(),
-            ctx.guild_id().unwrap(),
-            user.id,
-            Some(ctx.channel_id()),
-            &cfg,
-            levelup,
-        )
-        .await;
+    let credited = add_xp(&ctx.data().db, guild_id, receiver, amount).await;
+    match credited {
+        Ok(Some(levelup)) => {
+            let cfg = db::leveling_config(&ctx.data().db, guild_id).await?;
+            super::apply_levelup(
+                ctx.serenity_context(),
+                ctx.data(),
+                ctx.guild_id().unwrap(),
+                user.id,
+                Some(ctx.channel_id()),
+                &cfg,
+                levelup,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(why) => {
+            // The XP has left the sender but never arrived. Put it back rather
+            // than quietly deleting it.
+            tracing::error!("xp transfer failed after the debit, refunding: {why}");
+            let _ = add_xp(&ctx.data().db, guild_id, sender, amount).await;
+            ctx.send(poise::CreateReply::default().embed(embed::err(
+                "Something went wrong sending that XP, so I put it back. Try again.",
+            )))
+            .await?;
+            return Ok(());
+        }
     }
 
     ctx.send(poise::CreateReply::default().embed(embed::ok(format!(
@@ -453,6 +469,7 @@ pub async fn xpadmin(_ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Add XP to a member.
 #[poise::command(slash_command, rename = "give", guild_only)]
 pub async fn xp_give(
     ctx: Ctx<'_>,
@@ -482,6 +499,7 @@ pub async fn xp_give(
     Ok(())
 }
 
+/// Remove XP from a member.
 #[poise::command(slash_command, rename = "take", guild_only)]
 pub async fn xp_take(
     ctx: Ctx<'_>,
@@ -501,6 +519,7 @@ pub async fn xp_take(
     Ok(())
 }
 
+/// Put a member at a specific level.
 #[poise::command(slash_command, rename = "set", guild_only)]
 pub async fn xp_set(
     ctx: Ctx<'_>,
@@ -533,6 +552,7 @@ pub async fn xp_set(
     Ok(())
 }
 
+/// Reset one member's XP to zero.
 #[poise::command(slash_command, rename = "reset", guild_only)]
 pub async fn xp_reset(
     ctx: Ctx<'_>,
@@ -606,6 +626,7 @@ pub async fn levels(_ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Switch the XP system, and voice XP, on or off.
 #[poise::command(slash_command, rename = "toggle", guild_only)]
 pub async fn levels_toggle(
     ctx: Ctx<'_>,
@@ -632,6 +653,7 @@ pub async fn levels_toggle(
     Ok(())
 }
 
+/// XP per message, the cooldown, voice XP and the server-wide multiplier.
 #[poise::command(slash_command, rename = "rates", guild_only)]
 pub async fn levels_rates(
     ctx: Ctx<'_>,
@@ -679,6 +701,7 @@ pub async fn levels_rates(
     Ok(())
 }
 
+/// Where and how level-ups are announced.
 #[poise::command(slash_command, rename = "announce", guild_only)]
 pub async fn levels_announce(
     ctx: Ctx<'_>,
@@ -724,6 +747,7 @@ pub async fn levels_announce(
     Ok(())
 }
 
+/// Give a role automatically at a level, or remove that reward.
 #[poise::command(slash_command, rename = "reward", guild_only)]
 pub async fn levels_reward(
     ctx: Ctx<'_>,
@@ -764,6 +788,7 @@ pub async fn levels_reward(
     Ok(())
 }
 
+/// Choose whether reward roles stack or only the highest is kept.
 #[poise::command(slash_command, rename = "rewards", guild_only)]
 pub async fn levels_rewards(
     ctx: Ctx<'_>,
@@ -816,6 +841,7 @@ pub async fn levels_rewards(
     Ok(())
 }
 
+/// Give a role or channel an XP multiplier.
 #[poise::command(slash_command, rename = "multiplier", guild_only)]
 pub async fn levels_multiplier(
     ctx: Ctx<'_>,
@@ -845,6 +871,7 @@ pub async fn levels_multiplier(
             .bind(target)
             .execute(&ctx.data().db)
             .await?;
+        super::invalidate_multipliers(guild_id);
         ctx.send(poise::CreateReply::default().embed(embed::ok("Multiplier cleared.")))
             .await?;
         return Ok(());
@@ -860,6 +887,7 @@ pub async fn levels_multiplier(
     .bind(multiplier.clamp(0.0, 10.0))
     .execute(&ctx.data().db)
     .await?;
+    super::invalidate_multipliers(guild_id);
 
     ctx.send(poise::CreateReply::default().embed(embed::ok(format!(
         "Multiplier **{multiplier}x** set for that {kind}."
@@ -868,6 +896,7 @@ pub async fn levels_multiplier(
     Ok(())
 }
 
+/// Exclude a channel or role from earning XP.
 #[poise::command(slash_command, rename = "noxp", guild_only)]
 pub async fn levels_noxp(
     ctx: Ctx<'_>,
@@ -929,6 +958,7 @@ pub async fn levels_noxp(
     Ok(())
 }
 
+/// Show every leveling setting at a glance.
 #[poise::command(slash_command, rename = "status", guild_only)]
 pub async fn levels_status(ctx: Ctx<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().unwrap().get() as i64;

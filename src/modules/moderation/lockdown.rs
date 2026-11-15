@@ -78,9 +78,8 @@ async fn lock_channel(
     let deny = Permissions::from_bits_truncate(prev_deny as u64) | LOCK_DENY;
     let allow = Permissions::from_bits_truncate(prev_allow as u64) & !LOCK_DENY;
 
-    channel_id
-        .create_permission(
-            &sctx.http,
+    crate::compat::set_permission(
+            &sctx.http, channel_id,
             PermissionOverwrite {
                 allow,
                 deny,
@@ -112,18 +111,16 @@ async fn unlock_channel(
     match saved {
         Some((_, _, 0)) => {
             // There was no overwrite before we locked it, so remove ours entirely.
-            channel_id
-                .delete_permission(
-                    &sctx.http,
+            crate::compat::delete_permission(
+                    &sctx.http, channel_id,
                     PermissionOverwriteType::Role(everyone),
                     Some(reason),
                 )
                 .await?;
         }
         Some((allow, deny, _)) => {
-            channel_id
-                .create_permission(
-                    &sctx.http,
+            crate::compat::set_permission(
+                    &sctx.http, channel_id,
                     PermissionOverwrite {
                         allow: Permissions::from_bits_truncate(allow as u64),
                         deny: Permissions::from_bits_truncate(deny as u64),
@@ -135,9 +132,8 @@ async fn unlock_channel(
         }
         None => {
             // Not recorded: just clear the send-messages denial.
-            channel_id
-                .create_permission(
-                    &sctx.http,
+            crate::compat::set_permission(
+                    &sctx.http, channel_id,
                     PermissionOverwrite {
                         allow: Permissions::empty(),
                         deny: Permissions::empty(),

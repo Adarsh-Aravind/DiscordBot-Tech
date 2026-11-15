@@ -41,7 +41,7 @@ pub enum RoleKind {
     Admin,
     #[name = "moderator (bans, kicks, warns)"]
     Mod,
-    #[name = "staff (tickets, soft moderation)"]
+    #[name = "staff (soft moderation, announcements)"]
     Staff,
 }
 
@@ -84,10 +84,8 @@ pub async fn config_overview(ctx: Ctx<'_>) -> Result<(), Error> {
 
     let guild = db::guild_config(dbh, guild_id).await?;
     let welcome = db::welcome_config(dbh, guild_id).await?;
-    let tickets = db::ticket_config(dbh, guild_id).await?;
     let voice = db::voice_config(dbh, guild_id).await?;
     let leveling = db::leveling_config(dbh, guild_id).await?;
-    let starboard = db::starboard_config(dbh, guild_id).await?;
     let automod = db::automod_config(dbh, guild_id).await?;
 
     let channel = |value: Option<i64>| {
@@ -118,14 +116,8 @@ pub async fn config_overview(ctx: Ctx<'_>) -> Result<(), Error> {
     if welcome.welcome_channel.is_none() {
         todo.push("`/welcome channel` — set up welcome messages");
     }
-    if tickets.category_id.is_none() {
-        todo.push("`/tickets setup` — set up the ticket system");
-    }
     if voice.j2c_channel.is_none() {
         todo.push("`/voice setup` — set up join-to-create rooms");
-    }
-    if starboard.channel_id.is_none() {
-        todo.push("`/starboard setup` — set up the starboard");
     }
     if automod.alert_channel.is_none() {
         todo.push("`/automod alerts` — pick an automod alert channel");
@@ -157,12 +149,10 @@ pub async fn config_overview(ctx: Ctx<'_>) -> Result<(), Error> {
         .field(
             "Features",
             format!(
-                "Welcome: {}\nVerification: {}\nTickets: {}\nJoin-to-create: {}\nStarboard: {}\nXP: {}",
+                "Welcome: {}\nVerification: {}\nJoin-to-create: {}\nXP: {}",
                 if welcome.welcome_channel.is_some() { "🟢" } else { "🔴" },
                 if welcome.verify_role.is_some() { "🟢" } else { "🔴" },
-                if tickets.category_id.is_some() { "🟢" } else { "🔴" },
                 if voice.j2c_channel.is_some() { "🟢" } else { "🔴" },
-                if starboard.channel_id.is_some() { "🟢" } else { "🔴" },
                 if leveling.enabled == 1 { "🟢" } else { "🔴" }
             ),
             true,
@@ -285,7 +275,7 @@ pub async fn config_role(
     Ok(())
 }
 
-/// Change the text prefix used for custom commands and the few prefix commands.
+/// Change the text prefix used for the few prefix commands.
 #[poise::command(slash_command, rename = "prefix", guild_only)]
 pub async fn config_prefix(
     ctx: Ctx<'_>,
@@ -415,9 +405,7 @@ pub async fn config_export(ctx: Ctx<'_>) -> Result<(), Error> {
     let welcome = db::welcome_config(dbh, guild_id).await?;
     let automod = db::automod_config(dbh, guild_id).await?;
     let leveling = db::leveling_config(dbh, guild_id).await?;
-    let tickets = db::ticket_config(dbh, guild_id).await?;
     let voice = db::voice_config(dbh, guild_id).await?;
-    let starboard = db::starboard_config(dbh, guild_id).await?;
 
     let badwords: Vec<String> =
         sqlx::query_scalar("SELECT word FROM badwords WHERE guild_id = ?")
@@ -475,23 +463,11 @@ pub async fn config_export(ctx: Ctx<'_>) -> Result<(), Error> {
             "prestige_level": leveling.prestige_level,
             "rewards": rewards,
         },
-        "tickets": {
-            "category": tickets.category_id,
-            "log_channel": tickets.log_channel,
-            "support_roles": tickets.support_roles,
-            "max_open": tickets.max_open,
-            "auto_close_hours": tickets.auto_close_hours,
-        },
         "voice": {
             "j2c_channel": voice.j2c_channel,
             "j2c_category": voice.j2c_category,
             "default_name": voice.default_name,
             "afk_channel": voice.afk_channel,
-        },
-        "starboard": {
-            "channel": starboard.channel_id,
-            "threshold": starboard.threshold,
-            "emoji": starboard.emoji,
         },
     });
 
@@ -510,7 +486,11 @@ pub async fn config_export(ctx: Ctx<'_>) -> Result<(), Error> {
 }
 
 /// Register or clear slash commands. Bot owner only.
-#[poise::command(prefix_command, slash_command, owners_only, hide_in_help)]
+///
+/// Prefix-only on purpose: Discord allows at most 100 top-level slash commands,
+/// and a slash version could not bootstrap registration anyway. Run it as
+/// `!register` or `@bot register`.
+#[poise::command(prefix_command, owners_only, hide_in_help)]
 pub async fn register(ctx: Ctx<'_>) -> Result<(), Error> {
     poise::builtins::register_application_commands_buttons(ctx).await?;
     Ok(())

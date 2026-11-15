@@ -41,31 +41,16 @@ const ADMIN: &[&str] = &[
     "role",
     "levels",
     "xpadmin",
-    "tickets",
     "counting",
     "wordchain",
-    "customcommand",
-    "workflow",
-    "webhook",
-    "weeklyreport",
-    "schedule",
     "milestonechannel",
-    "countchannel",
     "feedbackchannel",
-    "bonusinvites",
     "lockdown",
     "clearwarns",
     "purgeuser",
     "escalation",
-    "starboard setup",
-    "starboard off",
     "voice setup",
-    "suggest channel",
     "dailyquestion channel",
-    "confess channel",
-    "confess reveal",
-    "confess ban",
-    "birthday channel",
 ];
 
 /// Commands and command trees that need the staff tier.
@@ -90,7 +75,6 @@ const STAFF: &[&str] = &[
     "giveaway",
     "appeal list",
     "appeal decide",
-    "suggest status",
     "event create",
     "event cancel",
     "event ping",
@@ -100,16 +84,6 @@ const STAFF: &[&str] = &[
     "trivia add",
     "dailyquestion now",
     "dailyquestion add",
-    "stats staff",
-    "stats moderation",
-    "ticket claim",
-    "ticket assign",
-    "ticket add",
-    "ticket remove",
-    "ticket priority",
-    "ticket rename",
-    "ticket reopen",
-    "ticket transcript",
 ];
 
 /// Does `name` start with `prefix` on a whole-segment boundary?
@@ -171,7 +145,8 @@ pub async fn check(ctx: Ctx<'_>) -> Result<bool, Error> {
         ),
         _ => (
             "staff",
-            "You need **Manage Messages** or a role set with `/config role`.",
+            "You need a moderator permission (Manage Messages, Kick, Ban or Timeout), \
+             or a role set with `/config role`.",
         ),
     };
 
@@ -210,22 +185,176 @@ mod tests {
         // /appeal is open to everyone, but reviewing appeals is not.
         assert_eq!(required_access("appeal submit"), Access::Everyone);
         assert_eq!(required_access("appeal decide"), Access::Staff);
-        assert_eq!(required_access("starboard top"), Access::Everyone);
-        assert_eq!(required_access("starboard setup"), Access::Admin);
-        assert_eq!(required_access("ticket new"), Access::Everyone);
-        assert_eq!(required_access("ticket close"), Access::Everyone);
-        assert_eq!(required_access("ticket claim"), Access::Staff);
-        assert_eq!(required_access("tickets panel"), Access::Admin);
+        assert_eq!(required_access("event list"), Access::Everyone);
+        assert_eq!(required_access("event create"), Access::Staff);
+        assert_eq!(required_access("dailyquestion channel"), Access::Admin);
+    }
+
+    /// Commands that anyone in the server may run.
+    ///
+    /// This list is the safety net for the one weakness of a prefix allowlist:
+    /// a command nobody adds to `ADMIN` or `STAFF` is public by default. Adding
+    /// a command that is not gated, has no `required_permissions` and no
+    /// `check` now fails this test, and the fix is either to gate it or to say
+    /// here, on purpose, that it is open to everyone.
+    const OPEN_TO_EVERYONE: &[&str] = &[
+        "achievements",
+        "afk",
+        "appeal submit",
+        "avatar",
+        "banner",
+        "botinfo",
+        "calculator",
+        "challenge list",
+        "challenge progress",
+        "channelinfo",
+        "event info",
+        "event list",
+        "feedback",
+        "help",
+        "leaderboard",
+        "levelcurve",
+        "mystats",
+        "permissions",
+        "ping",
+        "poll close",
+        "poll create",
+        "poll results",
+        "prestige",
+        "profile banner",
+        "profile bio",
+        "profile clear",
+        "profile colour",
+        "profile favourite",
+        "profile pronouns",
+        "profile timezone",
+        "profile view",
+        "quote add",
+        "quote get",
+        "quote list",
+        "quote random",
+        "rank",
+        "remind cancel",
+        "remind list",
+        "remind me",
+        "roleinfo",
+        "servericon",
+        "serverinfo",
+        "timestamp",
+        "translate",
+        "trivia leaderboard",
+        "trivia play",
+        "trivia stats",
+        "uptime",
+        "userinfo",
+        "voice claim",
+        "voice info",
+        "voice limit",
+        "voice lock",
+        "voice name",
+        "voice permit",
+        "voice private",
+        "voice public",
+        "voice reject",
+        "voice stats",
+        "voice transfer",
+        "voice unlock",
+        "weather",
+        "xptransfer",
+    ];
+
+    /// Walk every registered command and collect the ones nothing protects.
+    fn unprotected(
+        command: &poise::Command<crate::state::Data, crate::state::Error>,
+        out: &mut Vec<String>,
+    ) {
+        if !command.subcommands.is_empty() {
+            // A group is not invokable on its own; only its leaves are.
+            for sub in &command.subcommands {
+                unprotected(sub, out);
+            }
+            return;
+        }
+
+        let gated = required_access(&command.qualified_name) != Access::Everyone;
+        let needs_discord_permission = !command.required_permissions.is_empty();
+        let has_own_check = !command.checks.is_empty();
+
+        if !gated && !needs_discord_permission && !has_own_check {
+            out.push(command.qualified_name.clone());
+        }
+    }
+
+    /// Every command with `qualified_name` filled in ("profile view", not
+    /// "view"). poise only does this when it builds the framework, so the tests
+    /// have to do it themselves or they see bare subcommand names.
+    fn all_commands() -> Vec<poise::Command<crate::state::Data, crate::state::Error>> {
+        let mut commands = crate::modules::all();
+        poise::framework::set_qualified_names(&mut commands);
+        commands
+    }
+
+    #[test]
+    fn nothing_is_accidentally_public() {
+        let mut open = Vec::new();
+        for command in all_commands() {
+            unprotected(&command, &mut open);
+        }
+
+        let unexpected: Vec<&String> = open
+            .iter()
+            .filter(|name| !OPEN_TO_EVERYONE.contains(&name.as_str()))
+            .collect();
+
+        assert!(
+            unexpected.is_empty(),
+            "these commands are open to everyone and nothing says they should be.\n\
+             Add them to ADMIN or STAFF in gate.rs, give them required_permissions, \
+             or list them in OPEN_TO_EVERYONE if that is deliberate:\n{unexpected:#?}"
+        );
+    }
+
+    /// The other direction: an entry here that no longer matches a command is
+    /// stale, and stale entries are how a real command ends up excused.
+    #[test]
+    fn the_open_list_has_no_leftovers() {
+        let mut open = Vec::new();
+        for command in all_commands() {
+            unprotected(&command, &mut open);
+        }
+
+        let stale: Vec<&&str> = OPEN_TO_EVERYONE
+            .iter()
+            .filter(|name| !open.iter().any(|found| found == *name))
+            .collect();
+
+        assert!(
+            stale.is_empty(),
+            "these are listed as open to everyone but no longer match an \
+             ungated command - remove them from OPEN_TO_EVERYONE:\n{stale:#?}"
+        );
     }
 
     #[test]
     fn open_commands_stay_open() {
         for name in [
             "rank", "leaderboard", "profile view", "help", "ping", "avatar", "weather",
-            "poll create", "suggest new", "trivia play", "invites", "birthday set",
-            "voice name", "stats server", "remind me", "confess send", "quote add",
+            "poll create", "feedback", "trivia play", "remind me", "voice name",
+            "quote add", "profile timezone", "serverinfo",
         ] {
             assert_eq!(required_access(name), Access::Everyone, "{name}");
         }
+    }
+
+    /// Discord rejects the whole registration (and the bot fails to start) past
+    /// 100 top-level slash commands. Group new commands as subcommands instead.
+    #[test]
+    fn slash_commands_fit_discord_limit() {
+        // Same rule poise uses in `create_as_slash_command`.
+        let slash = crate::modules::all()
+            .iter()
+            .filter(|c| c.slash_action.is_some())
+            .count();
+        assert!(slash <= 100, "{slash} top-level slash commands; Discord allows 100");
     }
 }

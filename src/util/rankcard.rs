@@ -1,11 +1,17 @@
 //! Rank card rendering. Produces a PNG; callers fall back to an embed when this
 //! returns `None` (no font available, avatar fetch failed, ...).
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use ab_glyph::{FontVec, PxScale};
 use image::{Rgba, RgbaImage};
 use imageproc::drawing::{draw_filled_circle_mut, draw_filled_rect_mut, draw_text_mut, text_size};
 use imageproc::rect::Rect;
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
 
+#[derive(Clone, Debug)]
 pub struct RankInfo {
     pub name: String,
     pub discriminator: String,
@@ -32,13 +38,40 @@ const TRACK: Rgba<u8> = Rgba([58, 62, 74, 255]);
 const WHITE: Rgba<u8> = Rgba([245, 246, 250, 255]);
 const GREY: Rgba<u8> = Rgba([154, 160, 173, 255]);
 
+/// Fonts are read from disk once and kept. `render` used to read, and re-parse,
+/// the whole font file for every card.
+static FONTS: Lazy<RwLock<HashMap<String, Arc<FontVec>>>> = Lazy::new(Default::default);
+
+fn font_for(path: &str) -> Option<Arc<FontVec>> {
+    if let Some(font) = FONTS.read().get(path) {
+        return Some(Arc::clone(font));
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let font = Arc::new(FontVec::try_from_vec(bytes).ok()?);
+    FONTS.write().insert(path.to_string(), Arc::clone(&font));
+    Some(font)
+}
+
+/// Fetch what the card needs, then draw it off the async runtime.
+///
+/// Decoding the avatar, resizing it and encoding a PNG is tens of milliseconds
+/// of solid CPU work. Doing that inline blocked a runtime worker - and every
+/// other task it was due to poll - for the duration.
 pub async fn render(
     http: &reqwest::Client,
     font_path: Option<&str>,
     info: &RankInfo,
 ) -> Option<Vec<u8>> {
-    let font_bytes = std::fs::read(font_path?).ok()?;
-    let font = FontVec::try_from_vec(font_bytes).ok()?;
+    let font = font_for(font_path?)?;
+    let avatar = fetch(http, &info.avatar_url).await;
+    let info = info.clone();
+
+    tokio::task::spawn_blocking(move || draw(&font, &info, avatar))
+        .await
+        .ok()?
+}
+
+fn draw(font: &FontVec, info: &RankInfo, avatar_bytes: Option<Vec<u8>>) -> Option<Vec<u8>> {
     let accent = parse_hex(&info.accent).unwrap_or(Rgba([88, 101, 242, 255]));
 
     let mut canvas = RgbaImage::from_pixel(WIDTH, HEIGHT, BG);
@@ -64,7 +97,7 @@ pub async fn render(
     // Accent ring behind the avatar.
     draw_filled_circle_mut(&mut canvas, centre, (avatar_size / 2 + 5) as i32, accent);
 
-    if let Some(bytes) = fetch(http, &info.avatar_url).await {
+    if let Some(bytes) = avatar_bytes {
         if let Ok(avatar) = image::load_from_memory(&bytes) {
             let avatar = avatar
                 .resize_to_fill(
@@ -91,10 +124,10 @@ pub async fn render(
         text_x,
         52,
         name_scale,
-        &font,
+        font,
         &info.name,
     );
-    let (name_w, _) = text_size(name_scale, &font, &info.name);
+    let (name_w, _) = text_size(name_scale, font, &info.name);
     if !info.discriminator.is_empty() {
         draw_text_mut(
             &mut canvas,
@@ -102,7 +135,7 @@ pub async fn render(
             text_x + name_w as i32 + 10,
             64,
             label_scale,
-            &font,
+            font,
             &info.discriminator,
         );
     }
@@ -114,15 +147,15 @@ pub async fn render(
         format!("LVL {}", info.level)
     };
     let rank_text = format!("RANK #{}", info.rank);
-    let (lvl_w, _) = text_size(big_scale, &font, &level_text);
-    let (rank_w, _) = text_size(small_scale, &font, &rank_text);
+    let (lvl_w, _) = text_size(big_scale, font, &level_text);
+    let (rank_w, _) = text_size(small_scale, font, &rank_text);
     draw_text_mut(
         &mut canvas,
         accent,
         (WIDTH - 52) as i32 - lvl_w as i32,
         44,
         big_scale,
-        &font,
+        font,
         &level_text,
     );
     draw_text_mut(
@@ -131,7 +164,7 @@ pub async fn render(
         (WIDTH - 52) as i32 - rank_w as i32,
         92,
         small_scale,
-        &font,
+        font,
         &rank_text,
     );
 
@@ -166,7 +199,7 @@ pub async fn render(
         thousands(info.xp_needed),
         thousands(info.total_xp)
     );
-    draw_text_mut(&mut canvas, GREY, bar_x, bar_y - 32, small_scale, &font, &xp_text);
+    draw_text_mut(&mut canvas, GREY, bar_x, bar_y - 32, small_scale, font, &xp_text);
 
     let stats = format!(
         "{} messages   ·   {} in voice   ·   {} day streak",
@@ -180,7 +213,7 @@ pub async fn render(
         bar_x,
         (bar_y + bar_h as i32) + 10,
         small_scale,
-        &font,
+        font,
         &stats,
     );
 
@@ -224,15 +257,16 @@ fn encode_png(canvas: &RgbaImage) -> Option<Vec<u8>> {
     Some(buffer.into_inner())
 }
 
+/// Reuses the one colour parser the rest of the bot uses. Doing the byte
+/// slicing here by hand could panic on a stored value that was not ASCII.
 fn parse_hex(input: &str) -> Option<Rgba<u8>> {
-    let s = input.trim().trim_start_matches('#');
-    if s.len() != 6 {
-        return None;
-    }
-    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-    Some(Rgba([r, g, b, 255]))
+    let value = crate::util::embed::colour_value(input)?;
+    Some(Rgba([
+        ((value >> 16) & 0xFF) as u8,
+        ((value >> 8) & 0xFF) as u8,
+        (value & 0xFF) as u8,
+        255,
+    ]))
 }
 
 /// `1234567` -> `1,234,567`

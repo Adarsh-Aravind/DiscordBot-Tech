@@ -1,5 +1,5 @@
-//! Confessions, the quote collection, community challenges, member milestones
-//! and the timed quiz game.
+//! The quote collection, community challenges, member milestones and the
+//! timed quiz game.
 
 use chrono::Utc;
 use poise::serenity_prelude as serenity;
@@ -8,216 +8,6 @@ use serenity::{ChannelId, CreateMessage, GuildChannel, GuildId, Role, User};
 use crate::db;
 use crate::state::{Ctx, Data, Error};
 use crate::util::{embed, perms, text, time};
-
-// ===========================================================================
-// Confessions
-// ===========================================================================
-
-/// Post something anonymously.
-#[poise::command(
-    slash_command,
-    guild_only,
-    category = "Community",
-    subcommands("confess_send", "confess_channel", "confess_reveal", "confess_ban")
-)]
-pub async fn confess(_ctx: Ctx<'_>) -> Result<(), Error> {
-    Ok(())
-}
-
-/// Send an anonymous confession.
-#[poise::command(slash_command, rename = "send", guild_only, ephemeral)]
-pub async fn confess_send(
-    ctx: Ctx<'_>,
-    #[description = "What do you want to say?"] message: String,
-) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap().get() as i64;
-    let author = ctx.author().id.get() as i64;
-
-    // The author is stored so staff can act on abuse, and is never shown.
-    let banned: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM confessions WHERE guild_id = ? AND user_id = ? AND banned = 1",
-    )
-    .bind(guild_id)
-    .bind(author)
-    .fetch_one(&ctx.data().db)
-    .await?;
-
-    if banned > 0 {
-        ctx.send(
-            poise::CreateReply::default()
-                .embed(embed::err("You are blocked from using confessions here."))
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let Some(raw) = db::kv_get(&ctx.data().db, guild_id, "confession_channel").await else {
-        ctx.send(
-            poise::CreateReply::default()
-                .embed(embed::err("Confessions are not set up in this server."))
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    };
-    let Ok(channel_id) = raw.parse::<u64>() else {
-        return Ok(());
-    };
-
-    let number = db::next_number(&ctx.data().db, "confessions", "number", guild_id).await?;
-
-    let posted = ChannelId::new(channel_id)
-        .send_message(
-            ctx.http(),
-            CreateMessage::new().embed(
-                embed::titled(format!("Confession #{number}"), 0x9B59B6)
-                    .description(text::truncate(&message, 2000))
-                    .footer(embed::footer(
-                        "Sent anonymously · /confess send to post your own",
-                    )),
-            ),
-        )
-        .await?;
-
-    sqlx::query(
-        "INSERT INTO confessions (guild_id, number, user_id, content, message_id)
-         VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(guild_id)
-    .bind(number)
-    .bind(author)
-    .bind(&message)
-    .bind(posted.id.get() as i64)
-    .execute(&ctx.data().db)
-    .await?;
-
-    ctx.send(
-        poise::CreateReply::default()
-            .embed(embed::ok(format!(
-                "Posted as confession **#{number}**. Your name is not shown."
-            )))
-            .ephemeral(true),
-    )
-    .await?;
-    Ok(())
-}
-
-/// Where confessions are posted.
-#[poise::command(slash_command, rename = "channel", guild_only, check = "perms::admin_only")]
-pub async fn confess_channel(
-    ctx: Ctx<'_>,
-    #[description = "Confession channel"] channel: GuildChannel,
-) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap().get() as i64;
-    db::kv_set(
-        &ctx.data().db,
-        guild_id,
-        "confession_channel",
-        &channel.id.get().to_string(),
-    )
-    .await?;
-    ctx.send(poise::CreateReply::default().embed(embed::ok(format!(
-        "Confessions will be posted in <#{}>.",
-        channel.id.get()
-    ))))
-    .await?;
-    Ok(())
-}
-
-/// Reveal who sent a confession. Admin only, logged, for abuse handling.
-#[poise::command(slash_command, rename = "reveal", guild_only, check = "perms::admin_only")]
-pub async fn confess_reveal(
-    ctx: Ctx<'_>,
-    #[description = "Confession number"] number: i64,
-    #[description = "Why do you need to know?"] reason: String,
-) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap().get() as i64;
-    let found: Option<(i64, String)> = sqlx::query_as(
-        "SELECT user_id, content FROM confessions WHERE guild_id = ? AND number = ?",
-    )
-    .bind(guild_id)
-    .bind(number)
-    .fetch_optional(&ctx.data().db)
-    .await?;
-
-    let Some((user_id, content)) = found else {
-        ctx.send(
-            poise::CreateReply::default()
-                .embed(embed::err("No confession with that number."))
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    };
-
-    // Every reveal goes in the mod log, so this cannot be done quietly.
-    crate::logs::send(
-        ctx.serenity_context(),
-        &ctx.data().db,
-        guild_id,
-        crate::logs::Log::Mod,
-        embed::titled("🔎 Confession author revealed", embed::WARN)
-            .field("Confession", format!("#{number}"), true)
-            .field("Revealed by", format!("<@{}>", ctx.author().id.get()), true)
-            .field("Reason", text::truncate(&reason, 500), false),
-    )
-    .await;
-
-    ctx.send(
-        poise::CreateReply::default()
-            .embed(
-                embed::titled(format!("Confession #{number}"), embed::WARN)
-                    .field("Author", format!("<@{user_id}>"), true)
-                    .field("Content", text::truncate(&content, 1000), false)
-                    .footer(embed::footer("This reveal has been written to the mod log.")),
-            )
-            .ephemeral(true),
-    )
-    .await?;
-    Ok(())
-}
-
-/// Block someone from using confessions.
-#[poise::command(slash_command, rename = "ban", guild_only, check = "perms::admin_only")]
-pub async fn confess_ban(
-    ctx: Ctx<'_>,
-    #[description = "Confession number whose author should be blocked"] number: i64,
-) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap().get() as i64;
-    let author: Option<i64> =
-        sqlx::query_scalar("SELECT user_id FROM confessions WHERE guild_id = ? AND number = ?")
-            .bind(guild_id)
-            .bind(number)
-            .fetch_optional(&ctx.data().db)
-            .await?;
-
-    let Some(author) = author else {
-        ctx.send(
-            poise::CreateReply::default()
-                .embed(embed::err("No confession with that number."))
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    };
-
-    sqlx::query("UPDATE confessions SET banned = 1 WHERE guild_id = ? AND user_id = ?")
-        .bind(guild_id)
-        .bind(author)
-        .execute(&ctx.data().db)
-        .await?;
-
-    ctx.send(
-        poise::CreateReply::default()
-            .embed(embed::ok(
-                "That author is blocked from confessions. Their identity was not shown here.",
-            ))
-            .ephemeral(true),
-    )
-    .await?;
-    Ok(())
-}
 
 // ===========================================================================
 // Quotes
@@ -454,6 +244,7 @@ pub async fn challenge(_ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Start a community challenge with a target and a reward.
 #[poise::command(slash_command, rename = "create", guild_only, check = "perms::staff_only")]
 pub async fn challenge_create(
     ctx: Ctx<'_>,
@@ -510,6 +301,7 @@ pub async fn challenge_create(
     Ok(())
 }
 
+/// Challenges running right now.
 #[poise::command(slash_command, rename = "list", guild_only)]
 pub async fn challenge_list(ctx: Ctx<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().unwrap().get() as i64;
@@ -544,6 +336,7 @@ pub async fn challenge_list(ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// How far along a challenge is.
 #[poise::command(slash_command, rename = "progress", guild_only)]
 pub async fn challenge_progress(
     ctx: Ctx<'_>,
@@ -620,6 +413,7 @@ pub async fn challenge_progress(
     Ok(())
 }
 
+/// End a challenge early and hand out the reward.
 #[poise::command(slash_command, rename = "end", guild_only, check = "perms::staff_only")]
 pub async fn challenge_end(
     ctx: Ctx<'_>,
@@ -1089,7 +883,6 @@ pub async fn quiz(
 
 pub fn commands() -> Vec<poise::Command<Data, Error>> {
     vec![
-        confess(),
         quote(),
         challenge(),
         milestonechannel(),

@@ -16,6 +16,11 @@ use crate::state::Data;
 use crate::util::embed;
 
 /// Audit-log actions that can wreck a server when done in bulk.
+///
+/// This is deliberately an explicit list. It used to end with "anything whose
+/// label contains Delete", which swept up routine work - deleting old invites,
+/// tidying up emoji, removing a stale automod rule - and four of those inside
+/// the window was enough to strip a moderator of every role they had.
 const DESTRUCTIVE: &[&str] = &[
     "ChannelDelete",
     "Channel(Delete)",
@@ -25,18 +30,22 @@ const DESTRUCTIVE: &[&str] = &[
     "Member(BanAdd)",
     "MemberKick",
     "Member(Kick)",
+    "MemberPrune",
+    "Member(Prune)",
     "WebhookCreate",
     "Webhook(Create)",
     "EmojiDelete",
     "Emoji(Delete)",
     "StickerDelete",
+    "Sticker(Delete)",
     "IntegrationCreate",
-    "GuildUpdate",
+    "Integration(Create)",
+    "ChannelOverwriteDelete",
+    "Channel(OverwriteDelete)",
 ];
 
 fn is_destructive(label: &str) -> bool {
     DESTRUCTIVE.iter().any(|needle| label.contains(needle))
-        || (label.contains("Delete") && !label.contains("Message"))
 }
 
 /// Called for each audit log entry. Returns true when the actor was quarantined.
@@ -107,6 +116,37 @@ async fn quarantine(
 ) {
     let guild_i64 = guild_id.get() as i64;
 
+    // Step zero: write down what they had. Stripping the roles is the whole
+    // point, but the alert asks staff to put them back, and nothing knew what
+    // "back" was.
+    let previous_roles: Vec<serenity::RoleId> = match guild_id
+        .to_guild_cached(&sctx.cache)
+        .and_then(|guild| guild.members.get(&actor).map(|member| member.roles.clone()))
+    {
+        Some(roles) => roles,
+        None => guild_id
+            .member(sctx, actor)
+            .await
+            .map(|member| member.roles.clone())
+            .unwrap_or_default(),
+    };
+
+    if !previous_roles.is_empty() {
+        let csv = previous_roles
+            .iter()
+            .map(|role| role.get().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = crate::db::kv_set_with_ttl(
+            &data.db,
+            guild_i64,
+            &format!("antinuke.roles.{}", actor.get()),
+            &csv,
+            30 * 86_400,
+        )
+        .await;
+    }
+
     // Step one: take every role off them so the damage stops immediately.
     let stripped = guild_id
         .edit_member(
@@ -164,12 +204,25 @@ async fn quarantine(
             .join("\n")
     };
 
+    let roles_line = if previous_roles.is_empty() {
+        "*(none recorded)*".to_string()
+    } else {
+        crate::util::text::truncate(
+            &previous_roles
+                .iter()
+                .map(|role| format!("<@&{}>", role.get()))
+                .collect::<Vec<_>>()
+                .join(" "),
+            900,
+        )
+    };
+
     let alert = embed::titled("🧨 ANTI-NUKE TRIGGERED", embed::DANGER)
         .description(format!(
             "<@{}> performed **{count}** destructive actions in **{window}s**.\n\n\
              • All of their roles have been removed{}\n\
              • They are timed out for 24 hours (case #{case})\n\n\
-             Review and ban them, or restore their roles with `/role add`.",
+             Review and ban them, or give the roles below back with `/role add`.",
             actor.get(),
             if stripped {
                 ""
@@ -177,6 +230,7 @@ async fn quarantine(
                 " *(failed - my role may be below theirs)*"
             }
         ))
+        .field("Roles they had", roles_line, false)
         .field("Recent actions", trail, false)
         .footer(embed::footer(format!("Actor ID: {}", actor.get())));
 
@@ -195,6 +249,48 @@ async fn quarantine(
             let _ = channel
                 .send_message(&sctx.http, serenity::CreateMessage::new().embed(alert))
                 .await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These all used to count, because the old rule was "the label contains
+    /// Delete". Four of them in half a minute quarantined a moderator.
+    #[test]
+    fn routine_work_is_not_a_nuke() {
+        for label in [
+            "InviteDelete",
+            "Invite(Delete)",
+            "MessageDelete",
+            "MessageBulkDelete",
+            "AutoModRuleDelete",
+            "ScheduledEventDelete",
+            "ThreadDelete",
+            "GuildUpdate",
+            "MemberRoleUpdate",
+            "ChannelUpdate",
+        ] {
+            assert!(!is_destructive(label), "{label} counted as destructive");
+        }
+    }
+
+    #[test]
+    fn mass_destruction_still_counts() {
+        for label in [
+            "ChannelDelete",
+            "Channel(Delete)",
+            "RoleDelete",
+            "Role(Delete)",
+            "MemberBanAdd",
+            "Member(BanAdd)",
+            "MemberKick",
+            "WebhookCreate",
+            "EmojiDelete",
+        ] {
+            assert!(is_destructive(label), "{label} was missed");
         }
     }
 }

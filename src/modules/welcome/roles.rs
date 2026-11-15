@@ -455,6 +455,50 @@ fn can_assign(
 // Interaction handling
 // ===========================================================================
 
+/// A menu as the interaction handlers need it.
+struct Menu {
+    roles: Vec<MenuRole>,
+    max_choices: i64,
+}
+
+/// Load a menu by id, scoped to the guild the interaction came from.
+///
+/// Everything in a component's `custom_id` is just a claim: the message it sits
+/// on can outlive the menu, and nothing stops a crafted id naming another
+/// guild's menu. The database is the only authority on what a menu contains.
+async fn load_menu(db: &db::Db, guild_id: i64, menu_id: i64) -> Result<Option<Menu>, Error> {
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT roles, max_choices FROM role_menus WHERE id = ? AND guild_id = ?",
+    )
+    .bind(menu_id)
+    .bind(guild_id)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(row.map(|(raw, max_choices)| Menu {
+        roles: parse_roles(&raw),
+        max_choices,
+    }))
+}
+
+async fn respond_ephemeral(
+    sctx: &serenity::Context,
+    interaction: &ComponentInteraction,
+    body: impl Into<String>,
+) -> Result<(), Error> {
+    interaction
+        .create_response(
+            &sctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(body.into())
+                    .ephemeral(true),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
 /// Handle a role-menu button or dropdown. Returns true when it was ours.
 pub async fn handle_component(
     sctx: &serenity::Context,
@@ -469,10 +513,29 @@ pub async fn handle_component(
     // ---- single button ---------------------------------------------------
     if let Some(rest) = custom_id.strip_prefix("rolemenu:") {
         let mut parts = rest.split(':');
-        let _menu_id = parts.next().unwrap_or("");
+        let Some(menu_id) = parts.next().and_then(|s| s.parse::<i64>().ok()) else {
+            return Ok(true);
+        };
         let Some(role_id) = parts.next().and_then(|s| s.parse::<u64>().ok()) else {
             return Ok(true);
         };
+
+        // The button says which role it wants; the menu decides whether that is
+        // allowed. Taking the id on trust would hand out any role the bot can
+        // reach, including from menus that were deleted long ago.
+        let Some(menu) = load_menu(&data.db, guild_id.get() as i64, menu_id).await? else {
+            respond_ephemeral(sctx, interaction, "That role menu no longer exists.").await?;
+            return Ok(true);
+        };
+        if !menu.roles.iter().any(|r| r.role_id as u64 == role_id) {
+            respond_ephemeral(
+                sctx,
+                interaction,
+                "That role is not part of this menu any more.",
+            )
+            .await?;
+            return Ok(true);
+        }
 
         let role = RoleId::new(role_id);
         let has = interaction
@@ -508,7 +571,9 @@ pub async fn handle_component(
 
     // ---- dropdown --------------------------------------------------------
     if let Some(menu_id) = custom_id.strip_prefix("rolemenu_select:") {
-        let menu_id: i64 = menu_id.parse().unwrap_or(0);
+        let Ok(menu_id) = menu_id.parse::<i64>() else {
+            return Ok(true);
+        };
         let chosen: Vec<u64> = match &interaction.data.kind {
             serenity::ComponentInteractionDataKind::StringSelect { values } => {
                 values.iter().filter_map(|v| v.parse().ok()).collect()
@@ -516,14 +581,24 @@ pub async fn handle_component(
             _ => Vec::new(),
         };
 
-        let raw: Option<String> = sqlx::query_scalar("SELECT roles FROM role_menus WHERE id = ?")
-            .bind(menu_id)
-            .fetch_optional(&data.db)
+        let Some(menu) = load_menu(&data.db, guild_id.get() as i64, menu_id).await? else {
+            respond_ephemeral(sctx, interaction, "That role menu no longer exists.").await?;
+            return Ok(true);
+        };
+
+        // Discord enforces the limit in the client; re-check it here because a
+        // crafted interaction can send any number of values.
+        if menu.max_choices > 0 && chosen.len() as i64 > menu.max_choices {
+            respond_ephemeral(
+                sctx,
+                interaction,
+                format!("You can pick at most **{}** from this menu.", menu.max_choices),
+            )
             .await?;
-        let all: Vec<u64> = parse_roles(raw.as_deref().unwrap_or("[]"))
-            .iter()
-            .map(|r| r.role_id as u64)
-            .collect();
+            return Ok(true);
+        }
+
+        let all: Vec<u64> = menu.roles.iter().map(|r| r.role_id as u64).collect();
 
         let current: Vec<u64> = interaction
             .member
@@ -813,6 +888,7 @@ pub async fn role(_ctx: Ctx<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Give a member a role.
 #[poise::command(slash_command, rename = "add", guild_only)]
 pub async fn role_add(
     ctx: Ctx<'_>,
@@ -835,6 +911,7 @@ pub async fn role_add(
     Ok(())
 }
 
+/// Take a role off a member.
 #[poise::command(slash_command, rename = "remove", guild_only)]
 pub async fn role_remove(
     ctx: Ctx<'_>,

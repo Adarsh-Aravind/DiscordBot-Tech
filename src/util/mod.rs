@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod embed;
 pub mod perms;
 pub mod rankcard;

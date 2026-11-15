@@ -3,9 +3,10 @@
 A community management bot for the **MrTechTrivia** Discord, written in Rust.
 
 - **Stack:** Rust 2021 · [serenity](https://github.com/serenity-rs/serenity) 0.12 · [poise](https://github.com/serenity-rs/poise) 0.6 · SQLite via `sqlx`
-- **Scope:** moderation and anti-abuse, welcome and roles, levelling, tickets,
-  community engagement, voice rooms, analytics, automation, utilities
-- **Commands:** 65 top-level commands, ~300 command definitions including subcommands
+- **Scope:** moderation and anti-abuse, welcome and roles, levelling,
+  community engagement, voice rooms, announcements and reminders, utilities
+- **Commands:** 82 top-level slash commands, ~220 command definitions including subcommands
+  (Discord allows at most 100 top-level slash commands; a test enforces it)
 - **Storage:** one SQLite file, created and migrated on first run — no external services required
 
 ---
@@ -23,15 +24,16 @@ cargo build --release
    **Server Members Intent** and **Message Content Intent**. The bot will not start
    correctly without them: member tracking, welcome messages, automod, levelling and
    logging all depend on them.
-3. **Configure the environment.**
+3. **Configure the environment.** A ready-to-fill `.env` ships with the repo working
+   copy (it is gitignored and never committed); if it is missing, copy the reference:
 
 ```bash
 cp .env.example .env
 ```
 
-   Fill in `DISCORD_TOKEN`, and set `DEV_GUILD_ID` to your server's ID while you are
-   setting things up — slash commands then register instantly instead of taking up to
-   an hour to propagate globally.
+   Fill in `DISCORD_TOKEN` and `OWNER_IDS`, and set `DEV_GUILD_ID` to your server's ID
+   while you are setting things up — slash commands then register instantly instead of
+   taking up to an hour to propagate globally. Everything else has a working default.
 
 4. **Invite the bot** with the scopes `bot` and `applications.commands`, and the
    permissions listed under [Permissions](#permissions).
@@ -46,6 +48,8 @@ cargo run --release
 ```
 /config overview
 ```
+
+   and `/help` for the full command list.
 
    That lists what is configured and what is still missing, with the exact command for
    each remaining step.
@@ -63,10 +67,9 @@ The bot asks Discord for nothing it does not use. The minimum for everything to 
 | Manage Roles | auto-roles, role menus, verification, level rewards |
 | Kick Members, Ban Members | `/kick`, `/ban`, raid response |
 | Moderate Members | `/timeout`, automod timeouts |
-| Manage Channels | tickets, lockdown, join-to-create rooms, slowmode |
+| Manage Channels | lockdown, join-to-create rooms, slowmode |
 | Move Members | AFK moving, join-to-create |
 | Manage Nicknames | `/nick` |
-| Manage Server | invite tracking (reading the invite list) |
 | View Audit Log | anti-nuke |
 | Add Reactions | counting and word-chain feedback |
 
@@ -96,7 +99,7 @@ Everything below is implemented. Where a feature has a caveat, it is stated.
 | Anti-flood | per-channel message rate |
 | Anti-raid | join-burst detection → lockdown, kick, ban or alert; raid mode |
 | Anti-nuke | audit-log watch for destructive bursts → strips roles, timeout, alerts the owner |
-| Anti-phishing links | built-in domain list, brand-impersonation heuristics, optional remote feed |
+| Anti-phishing links | built-in domain list (ban), brand-impersonation heuristics (delete + alert), optional remote feed |
 | Anti-invite links | `/automod toggle` |
 | Anti-mention spam | configurable mention limit |
 | Bad-word filter | `/badword add/remove/list`, matches through leetspeak substitutions |
@@ -105,7 +108,7 @@ Everything below is implemented. Where a feature has a caveat, it is stated.
 | New-member verification | `/verification setup` + button panel, optional account-age gate |
 | Automatic punishment escalation | `/escalation set` — ladder keyed on active warning count |
 | Moderation appeals | `/appeal submit`, `/appeal list`, `/appeal decide` (accepting a ban appeal lifts the ban) |
-| Moderator action logs | `/modlogs <moderator>`, `/stats staff` |
+| Moderator action logs | `/modlogs <moderator>` |
 | Custom automod rules | `/rule add` — contains, starts/ends with, word list, regex, attachment, sticker; `/rule test` dry-runs text |
 | Channel lockdown | `/lock`, `/unlock` — saves and restores the previous overwrite |
 | Emergency server lockdown | `/lockdown start`, `/lockdown end`, `/lockdown status` |
@@ -114,12 +117,12 @@ Everything below is implemented. Where a feature has a caveat, it is stated.
 
 Custom welcome messages (channel and/or DM, plain or embed) · auto-role assignment
 (separate list for bots) · button roles · dropdown roles · self-role menus
-(`/rolemenu`) · rules acceptance (`/rules`) · member profiles (`/profile`) · member
-activity tracking (`/stats me`) · invite tracking (`/invites`, `/inviteboard`,
-`/inviteinfo`, `/bonusinvites`) · custom nicknames (`/nick`).
+(`/rolemenu`) · rules acceptance (`/rules`) · member profiles (`/profile`) · custom
+nicknames (`/nick`).
 
 Placeholders for welcome and goodbye text: `{mention}` `{user}` `{tag}` `{id}`
-`{server}` `{count}` `{inviter}`.
+`{server}` `{count}`. (`{inviter}` from the old invite tracking still renders, as
+"someone", so existing messages do not show raw braces.)
 
 ### 3. Levelling and XP
 
@@ -127,7 +130,7 @@ Message-based XP with a configurable range and cooldown · voice-based XP accrue
 five minutes · custom XP rates and a server-wide multiplier · level-up announcements
 (channel or DM) · **rank cards rendered as PNGs** · server leaderboard · role rewards
 (stacking or highest-only) · per-role and per-channel XP multipliers · `/xptransfer` ·
-`/xpadmin reset` / `resetall` · prestige · 12 achievement badges · daily activity
+`/xpadmin reset` / `resetall` · prestige · 11 achievement badges · daily activity
 streaks with a small XP bonus · profile customisation · `/levelcurve`.
 
 > **Rank cards** need a TrueType font. The bot looks for `assets/font.ttf`, then common
@@ -135,31 +138,17 @@ streaks with a small XP bonus · profile customisation · `/levelcurve`.
 > With no font available `/rank` falls back to an embed with a text progress bar —
 > same information, no image.
 
-### 4. Tickets and support
+### 4. Community engagement
 
-Ticket panels with buttons or a dropdown · multiple categories with their own support
-roles, channel category and template · private channels · claiming · assignment ·
-add/remove members · four priority levels (reflected in the channel name) · closing
-with a reason · reopening (carrying the old conversation across) · plain-text
-transcripts attached to the log and DMed to the opener · automatic closure after a
-configurable idle period · 1–5 star feedback ratings · first-response tracking ·
-`/tickets stats` (volume, average first response, average time to close, average
-rating) · `/tickets staff` leaderboard.
-
-### 5. Community engagement
-
-Polls (`/poll`, anonymous and multiple-choice, auto-closing) · suggestions with voting
-and a status workflow that DMs the author · giveaways with required roles, bonus
-entries, a minimum level, rerolls and winner DMs · scheduled announcements
-(`/schedule`) · events with RSVP buttons, attendee caps and 15-minute reminders ·
-birthday announcements with a role for the day · a daily question with a 20-question
+Polls (`/poll`, anonymous and multiple-choice, auto-closing) · giveaways with required
+roles, bonus entries, a minimum level, rerolls and winner DMs · events with RSVP
+buttons, attendee caps and 15-minute reminders · a daily question with a 20-question
 starter pool · tech trivia (25 seeded questions, add your own) · timed `/quiz` rounds ·
-a counting channel · word chain · confessions (anonymous, with an audited
-`/confess reveal` for abuse) · anonymous feedback · starboard · quote collection ·
-community challenges with role and XP rewards · member-count milestones · server
-anniversary announcements.
+a counting channel · word chain · anonymous feedback to staff (`/feedback`) · quote
+collection · community challenges with role and XP rewards · member-count milestones ·
+server anniversary announcements.
 
-### 6. Voice channel management
+### 5. Voice channel management
 
 Join-to-create temporary rooms · owner controls (`/voice name`, `limit`, `lock`,
 `unlock`, `private`, `public`, `permit`, `reject`) · ownership transfer and `/voice
@@ -167,28 +156,22 @@ claim` when the owner leaves · voice activity XP · session tracking · AFK cha
 an idle timeout · automatic deletion of empty rooms (including orphans left by a
 restart) · `/voice stats`.
 
-### 7. Analytics
+### 6. Announcements and reminders
 
-`/stats server` · `/stats members` (growth, best/worst day, rejoins) ·
-`/stats activity` (DAU/WAU/MAU and stickiness) · `/stats channels` ·
-`/stats peak` (hourly heat chart) · `/stats retention` · `/stats staff` ·
-`/stats commands` · `/stats moderation` · `/stats me` · `/membercount` ·
-`/countchannel` (live member count in a channel name) · `/botinfo` for uptime.
+`/announce` posts an announcement now · reminders (`/remind me`, repeating, DM or
+channel).
 
-### 8. Automation
-
-Scheduled and repeating messages · reminders (`/remind me`, repeating, DM or channel) ·
-a workflow engine (`/workflow`) with seven triggers, six actions, threshold conditions
-and delayed execution · custom text commands (`/customcommand`) · outbound webhook
-integrations · automatic weekly reports.
-
-### 9. Utilities
+### 7. Utilities
 
 `/avatar` `/banner` `/userinfo` `/serverinfo` `/servericon` `/roleinfo` `/channelinfo`
 `/botinfo` `/ping` `/uptime` `/poll` `/remind` `/calculator` `/translate` `/weather`
-`/embed` `/afk` `/snipe` `/editsnipe` `/inviteinfo` `/membercount` `/permissions`
+`/embed` `/afk` `/snipe` `/editsnipe` `/permissions`
 `/timestamp` `/help`.
 
+- `/help` lists every command grouped by category, with a badge per command for
+  who may run it (🟢 anyone, 🔵 staff, 🔴 admin, 🔑 a Discord permission) taken from
+  the gate itself, so it cannot drift. `/help category:Moderation` lists one group with
+  descriptions; `/help command:remind me` explains a single subcommand.
 - `/weather` uses **Open-Meteo** and needs no API key.
 - `/calculator` is a self-contained expression evaluator (no `eval`, no dependency).
 - `/translate` needs a LibreTranslate-compatible endpoint in `TRANSLATE_API_URL`.
@@ -196,16 +179,13 @@ integrations · automatic weekly reports.
 
 ---
 
-## Not included, and why
+## Removed features
 
-Your list placed **gaming statistics, clan rankings, tournament statistics and economy
-statistics** under analytics, but the gaming, clan, tournament and economy *modules*
-those would report on were not part of the request (sections 4, 5 and 9 of your
-numbering are absent). Reporting on data nothing produces would be an empty screen, so
-those four analytics items are not implemented. Everything else on your list is.
-
-If you want the economy, clans or tournaments themselves, they slot in alongside the
-existing modules and their statistics then follow naturally.
+Analytics (`/stats`, `/membercount`, `/countchannel` and all activity tracking), tickets,
+starboard, suggestions, confessions, birthdays, invite tracking (another bot handles
+it), scheduled messages, custom commands, workflows, outbound webhooks and weekly
+reports were removed. Their tables and columns are dropped on startup by
+`retire_removed_features` in `db.rs`.
 
 ---
 
@@ -222,17 +202,15 @@ src/
   logs.rs              one place that decides which channel audit output goes to
   events.rs            the gateway event router
   tasks.rs             background loops (5 intervals) and the daily jobs
-  util/                embeds, time, text, permissions, rank-card rendering
+  util/                embeds, time, text, permissions, caching, rank-card rendering
   modules/
     moderation/        case engine + actions, cases, purge, lockdown
     automod/            message scanning, raid, nuke, rules UI
-    welcome/            join/leave, roles, invites, profiles
+    welcome/            join/leave, roles, profiles
     leveling/           XP engine + commands
-    tickets/            lifecycle + commands
-    community/          polls, suggestions, giveaways, events, games, starboard, misc
+    community/          polls, feedback, giveaways, events, games, misc
     voice/              join-to-create and tracking
-    analytics.rs        counters and reports
-    automation.rs       scheduler, workflows, custom commands, webhooks
+    automation.rs       announcements and reminders
     utility.rs          information and tools
     settings.rs         /config
 migrations/schema.sql   the whole schema, idempotent, run on every boot
@@ -248,14 +226,26 @@ A few decisions worth knowing about:
   check on every subcommand and risk missing one, the policy is a single table matched
   by longest command-path prefix, wired in as the framework-wide `command_check`. It has
   unit tests, including that `/appeal submit` stays open while `/appeal decide` does not.
+  A prefix allowlist has one weakness - anything nobody adds to it is public - so a test
+  walks every registered command and fails if one is ungated, carries no
+  `required_permissions` and no `check`, unless it is listed as deliberately open.
+- **Only a known scam domain is an automatic ban.** The impersonation heuristic works on
+  brand names in a hostname, which will see false positives, so it deletes and alerts and
+  leaves the decision to staff. The host of a URL is read as the part after the last `@`,
+  because `https://discord.com@evil.site/` goes to `evil.site`.
+- **Counters are handed out in one statement.** Case and quote numbers come
+  from an `UPSERT ... RETURNING`, so two moderators acting at the same instant cannot be
+  given the same number - which used to mean the second case failed to save *after* the
+  ban had already happened.
+- **XP is written with a compare-and-set.** Read-modify-write loses an award whenever two
+  land together, and transfers debit with a conditional `UPDATE` so the same XP cannot be
+  spent twice.
 - **Lockdown saves the previous overwrite** before denying `Send Messages`, so unlocking
   restores exactly what was there instead of wiping staff-made permissions.
 - **Anti-nuke strips roles and times out rather than banning.** A false positive that
   bans a senior admin is worse than one a human has to finish, so the destructive step
   is left to staff. The owner is DMed because the log channels may be gone.
-- **Confessions store the author.** They are never displayed, but `/confess reveal`
-  exists for abuse handling and writes every use to the mod log, so it cannot be done
-  quietly. Anonymous feedback stores no author at all.
+- **Anonymous feedback stores no author at all.**
 - **Timestamps are one format everywhere** (`%Y-%m-%d %H:%M:%S`, UTC), matching
   SQLite's `datetime('now')`, so Rust and SQL agree without timezone surprises.
 - **No `sqlx` compile-time macros.** All queries are runtime (`sqlx::query*`), so the
@@ -267,15 +257,18 @@ A few decisions worth knowing about:
 
 | Interval | Work |
 |---|---|
-| 30 s | expired timeouts and temp bans, scheduled messages, reminders, delayed workflow actions |
+| 30 s | expired timeouts and temp bans, reminders, empty temp voice rooms past their grace period |
 | 1 min | closing polls, drawing giveaways, event reminders |
-| 5 min | voice XP accrual, AFK sweep, idle ticket auto-close |
-| 1 h | weekly reports, member-count channels, challenge rewards, pruning, member-count snapshots |
-| 15 min | the once-a-day batch: birthdays, daily question, anniversaries, achievement refresh (runs after 09:00 UTC) |
+| 5 min | voice XP accrual, AFK sweep |
+| 1 h | challenge rewards, pruning |
+| 15 min | the once-a-day batch: daily question, anniversaries, achievement refresh (runs after 09:00 UTC) |
 
 Pruning keeps the database small: the message log is trimmed to 14 days (it exists only
-for edit/delete logs and `/snipe`), per-day activity to ~13 months, closed voice
-sessions to 90 days.
+for edit/delete logs and `/snipe`), closed voice sessions to 90 days, and short-lived
+settings rows once they are
+past their expiry. The hourly job also prunes the in-memory automod windows and snipe
+slots, so a long-running process does not keep an entry for every member it has ever
+seen - and `/snipe` cannot resurrect something deleted days ago.
 
 ---
 
@@ -285,11 +278,6 @@ sessions to 90 days.
   `/config export` gives a per-server JSON snapshot of the settings.
 - **The bot shuts down cleanly on Ctrl-C** so SQLite flushes its write-ahead log. Prefer
   it over killing the process.
-- **Analytics start when the bot joins.** It cannot backfill history it never saw; the
-  relevant embeds say so rather than implying the numbers are complete.
-- **Invite tracking needs Manage Server** and works by diffing invite use counts on each
-  join — the standard approach, and the only one Discord allows. It cannot attribute a
-  join through a vanity URL or a widget.
 - **Logging:** set `RUST_LOG=mrtechtrivia_bot=debug` for verbose output.
 
 ### Running as a service (systemd)

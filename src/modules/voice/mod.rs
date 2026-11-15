@@ -53,11 +53,15 @@ pub async fn handle_voice_state(
         )
         .await;
 
-        maybe_delete_temp(sctx, data, guild_id, left, &cfg.delete_empty).await;
+        maybe_delete_temp(sctx, data, guild_id, left, &cfg).await;
     }
 
     // ---- joined a channel ------------------------------------------------
     if let Some(joined) = new_channel {
+        // Somebody is back before the grace period ran out, so the room is not
+        // going anywhere.
+        data.pending_voice_delete.remove(&joined.get());
+
         data.voice_since
             .insert((guild_i64 as u64, user_id.get()), Instant::now());
 
@@ -227,30 +231,50 @@ fn occupancy(sctx: &serenity::Context, guild_id: GuildId, channel: ChannelId) ->
     }
 }
 
-/// Delete a temporary room once it empties out.
+/// Delete a temporary room once it empties out, after the configured grace.
+///
+/// `empty_grace` is in the config and in the schema but nothing ever read it,
+/// so a room vanished the instant its last member left - including when they
+/// were only hopping to another channel and straight back.
 async fn maybe_delete_temp(
     sctx: &serenity::Context,
     data: &Data,
     guild_id: GuildId,
     channel: ChannelId,
-    delete_empty: &i64,
+    cfg: &db::VoiceConfig,
 ) {
-    if *delete_empty == 0 {
+    if cfg.delete_empty == 0 {
         return;
     }
-    let is_temp: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM temp_voice WHERE channel_id = ?")
-            .bind(channel.get() as i64)
-            .fetch_one(&data.db)
-            .await
-            .unwrap_or(0);
-    if is_temp == 0 {
+    if !is_temp_room(data, channel).await {
         return;
     }
     if occupancy(sctx, guild_id, channel) > 0 {
         return;
     }
 
+    if cfg.empty_grace > 0 {
+        // Hand it to the sweep, which checks again when the grace is up.
+        data.pending_voice_delete
+            .entry(channel.get())
+            .or_insert_with(Instant::now);
+        return;
+    }
+
+    delete_temp_room(sctx, data, channel).await;
+}
+
+async fn is_temp_room(data: &Data, channel: ChannelId) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM temp_voice WHERE channel_id = ?")
+        .bind(channel.get() as i64)
+        .fetch_one(&data.db)
+        .await
+        .unwrap_or(0)
+        > 0
+}
+
+async fn delete_temp_room(sctx: &serenity::Context, data: &Data, channel: ChannelId) {
+    data.pending_voice_delete.remove(&channel.get());
     if crate::compat::delete_channel(&sctx.http, channel, "Temporary voice room is empty")
         .await
         .is_ok()
@@ -259,6 +283,50 @@ async fn maybe_delete_temp(
             .bind(channel.get() as i64)
             .execute(&data.db)
             .await;
+    }
+}
+
+/// Delete the temporary rooms whose grace period has run out and which are
+/// still empty. Runs on the fast loop, since the grace is usually seconds.
+pub async fn sweep_pending_deletes(sctx: &serenity::Context, data: &Data) {
+    let pending: Vec<(u64, Instant)> = data
+        .pending_voice_delete
+        .iter()
+        .map(|entry| (*entry.key(), *entry.value()))
+        .collect();
+
+    for (channel_raw, since) in pending {
+        let channel = ChannelId::new(channel_raw);
+
+        let row: Option<i64> =
+            sqlx::query_scalar("SELECT guild_id FROM temp_voice WHERE channel_id = ?")
+                .bind(channel_raw as i64)
+                .fetch_optional(&data.db)
+                .await
+                .ok()
+                .flatten();
+
+        // Not a temporary room any more: nothing to wait for.
+        let Some(guild_i64) = row else {
+            data.pending_voice_delete.remove(&channel_raw);
+            continue;
+        };
+        let guild_id = GuildId::new(guild_i64 as u64);
+
+        if occupancy(sctx, guild_id, channel) > 0 {
+            data.pending_voice_delete.remove(&channel_raw);
+            continue;
+        }
+
+        let grace = db::voice_config(&data.db, guild_i64)
+            .await
+            .map(|cfg| cfg.empty_grace.max(0) as u64)
+            .unwrap_or(10);
+        if since.elapsed().as_secs() < grace {
+            continue;
+        }
+
+        delete_temp_room(sctx, data, channel).await;
     }
 }
 
@@ -567,9 +635,8 @@ async fn set_everyone(
     deny: Permissions,
 ) -> Result<(), Error> {
     let guild_id = ctx.guild_id().unwrap();
-    channel
-        .create_permission(
-            ctx.http(),
+    crate::compat::set_permission(
+            ctx.http(), channel,
             PermissionOverwrite {
                 allow,
                 deny,
@@ -676,9 +743,8 @@ pub async fn voice_permit(
     let Some(channel) = require_room(&ctx).await? else {
         return Ok(());
     };
-    channel
-        .create_permission(
-            ctx.http(),
+    crate::compat::set_permission(
+            ctx.http(), channel,
             PermissionOverwrite {
                 allow: Permissions::VIEW_CHANNEL | Permissions::CONNECT,
                 deny: Permissions::empty(),
@@ -717,9 +783,8 @@ pub async fn voice_reject(
         return Ok(());
     }
 
-    channel
-        .create_permission(
-            ctx.http(),
+    crate::compat::set_permission(
+            ctx.http(), channel,
             PermissionOverwrite {
                 allow: Permissions::empty(),
                 deny: Permissions::CONNECT,
@@ -801,9 +866,8 @@ pub async fn voice_transfer(
         .execute(&ctx.data().db)
         .await?;
 
-    let _ = channel
-        .create_permission(
-            ctx.http(),
+    let _ = crate::compat::set_permission(
+            ctx.http(), channel,
             PermissionOverwrite {
                 allow: Permissions::MANAGE_CHANNELS | Permissions::MOVE_MEMBERS,
                 deny: Permissions::empty(),
@@ -892,9 +956,8 @@ pub async fn voice_claim(ctx: Ctx<'_>) -> Result<(), Error> {
         .execute(&ctx.data().db)
         .await?;
 
-    let _ = channel
-        .create_permission(
-            ctx.http(),
+    let _ = crate::compat::set_permission(
+            ctx.http(), channel,
             PermissionOverwrite {
                 allow: Permissions::MANAGE_CHANNELS | Permissions::MOVE_MEMBERS,
                 deny: Permissions::empty(),

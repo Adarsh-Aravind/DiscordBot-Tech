@@ -203,8 +203,11 @@ pub async fn serverinfo(ctx: Ctx<'_>) -> Result<(), Error> {
         verification: String,
     }
 
-    let snapshot = match guild_id.to_guild_cached(&ctx.serenity_context().cache) {
-        Some(guild) => Snapshot {
+    // Build the snapshot in its own statement so the cache guard (which is not
+    // `Send`) is dropped before any `.await` below.
+    let snapshot = guild_id
+        .to_guild_cached(&ctx.serenity_context().cache)
+        .map(|guild| Snapshot {
             name: guild.name.clone(),
             owner: guild.owner_id.get(),
             members: guild.member_count as i64,
@@ -235,14 +238,13 @@ pub async fn serverinfo(ctx: Ctx<'_>) -> Result<(), Error> {
             banner: guild.banner_url(),
             description: guild.description.clone(),
             verification: format!("{:?}", guild.verification_level),
-        },
-        None => {
-            ctx.send(poise::CreateReply::default().embed(embed::err(
-                "I do not have this server cached yet. Try again in a moment.",
-            )))
-            .await?;
-            return Ok(());
-        }
+        });
+    let Some(snapshot) = snapshot else {
+        ctx.send(poise::CreateReply::default().embed(embed::err(
+            "I do not have this server cached yet. Try again in a moment.",
+        )))
+        .await?;
+        return Ok(());
     };
 
     let created = guild_id.created_at().unix_timestamp();
@@ -429,16 +431,6 @@ pub async fn channelinfo(
         }
     };
 
-    let messages_30: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(messages), 0) FROM channel_activity
-         WHERE guild_id = ? AND channel_id = ? AND day >= ?",
-    )
-    .bind(guild_id.get() as i64)
-    .bind(channel.id.get() as i64)
-    .bind(time::day_offset(30))
-    .fetch_one(&ctx.data().db)
-    .await?;
-
     let mut e = embed::titled(format!("Channel · #{}", channel.name), embed::INFO)
         .field("ID", format!("`{}`", channel.id.get()), true)
         .field("Type", format!("{:?}", channel.kind), true)
@@ -449,7 +441,6 @@ pub async fn channelinfo(
             format!("<t:{}:R>", channel.id.created_at().unix_timestamp()),
             true,
         )
-        .field("Messages (30d)", thousands(messages_30), true)
         .field(
             "Permission overwrites",
             channel.permission_overwrites.len().to_string(),
@@ -1411,75 +1402,279 @@ pub async fn editsnipe(ctx: Ctx<'_>) -> Result<(), Error> {
 // Help
 // ===========================================================================
 
-/// List the commands, or get help on one.
+/// The categories commands are filed under, for `/help category:`.
+#[derive(Debug, poise::ChoiceParameter)]
+pub enum HelpCategory {
+    Moderation,
+    Automod,
+    Community,
+    Games,
+    Leveling,
+    Profile,
+    Voice,
+    Welcome,
+    Roles,
+    Automation,
+    Utility,
+    Settings,
+}
+
+impl HelpCategory {
+    /// The string the `category = "..."` attributes use.
+    fn key(&self) -> &'static str {
+        match self {
+            Self::Moderation => "Moderation",
+            Self::Automod => "Automod",
+            Self::Community => "Community",
+            Self::Games => "Games",
+            Self::Leveling => "Leveling",
+            Self::Profile => "Profile",
+            Self::Voice => "Voice",
+            Self::Welcome => "Welcome",
+            Self::Roles => "Roles",
+            Self::Automation => "Automation",
+            Self::Utility => "Utility",
+            Self::Settings => "Settings",
+        }
+    }
+}
+
+/// Who may run a command, taken from the same policy the gate enforces so this
+/// cannot drift from what actually happens.
+fn tier_badge(command: &poise::Command<Data, Error>) -> &'static str {
+    if !command.required_permissions.is_empty() {
+        return "🔑";
+    }
+    match crate::gate::required_access(&command.qualified_name) {
+        crate::gate::Access::Admin => "🔴",
+        crate::gate::Access::Staff => "🔵",
+        crate::gate::Access::Everyone => "🟢",
+    }
+}
+
+/// Every command that can actually be run, with the category it belongs to.
+///
+/// A command with subcommands is a group: Discord will not let anyone invoke it
+/// on its own, and only the parent carries the `category`, so that is handed
+/// down as we walk.
+fn collect_runnable<'a>(
+    command: &'a poise::Command<Data, Error>,
+    inherited: Option<&'a str>,
+    out: &mut Vec<(&'a str, &'a poise::Command<Data, Error>)>,
+) {
+    if command.hide_in_help {
+        return;
+    }
+    let category = command.category.as_deref().or(inherited);
+
+    if command.subcommands.is_empty() {
+        out.push((category.unwrap_or("Other"), command));
+        return;
+    }
+    for sub in &command.subcommands {
+        collect_runnable(sub, category, out);
+    }
+}
+
+/// `🟢 /ban — Ban a member.`, or just the name when a command has no
+/// description, so the line never trails off with a dangling dash.
+fn help_line(command: &poise::Command<Data, Error>) -> String {
+    let badge = tier_badge(command);
+    let name = &command.qualified_name;
+    match command.description.as_deref().map(str::trim) {
+        Some(description) if !description.is_empty() => {
+            format!("{badge} `/{name}` — {description}")
+        }
+        _ => format!("{badge} `/{name}`"),
+    }
+}
+
+/// Group commands by the path they hang off, so a whole family fits on one
+/// line: `/quote add|get|random|list`.
+fn compact_lines(commands: &[&poise::Command<Data, Error>]) -> Vec<String> {
+    let mut standalone: Vec<String> = Vec::new();
+    let mut families: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+
+    for command in commands {
+        match command.qualified_name.rsplit_once(' ') {
+            Some((parent, child)) => families
+                .entry(parent.to_string())
+                .or_default()
+                .push(child.to_string()),
+            None => standalone.push(format!("`/{}`", command.qualified_name)),
+        }
+    }
+
+    let mut lines: Vec<String> = families
+        .into_iter()
+        .map(|(parent, children)| format!("`/{parent} {}`", children.join("|")))
+        .collect();
+    if !standalone.is_empty() {
+        lines.push(standalone.join(" "));
+    }
+    lines
+}
+
+/// Every command, the commands in one category, or one command in detail.
 #[poise::command(slash_command, prefix_command, category = "Utility")]
 pub async fn help(
     ctx: Ctx<'_>,
-    #[description = "A command to read about"] command: Option<String>,
+    #[description = "A command to read about, e.g. ban or remind me"] command: Option<String>,
+    #[description = "Show every command in one category, with descriptions"] category: Option<
+        HelpCategory,
+    >,
 ) -> Result<(), Error> {
+    const LEGEND: &str = "🟢 anyone · 🔵 staff · 🔴 admin · 🔑 needs a Discord permission";
+
+    // Flatten the whole tree once: every runnable command with its category.
+    let registered = &ctx.framework().options().commands;
+    let mut runnable: Vec<(&str, &poise::Command<Data, Error>)> = Vec::new();
+    for top in registered {
+        collect_runnable(top, None, &mut runnable);
+    }
+
+    // ---- one command in detail -------------------------------------------
     if let Some(name) = command {
-        let needle = name.trim().trim_start_matches('/').to_lowercase();
-        let found = ctx
-            .framework()
-            .options()
-            .commands
+        // Accept "/ban", "ban", and a subcommand path like "remind me".
+        let needle = name
+            .trim()
+            .trim_start_matches('/')
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+
+        // Groups are worth describing too, so search the tree, not just leaves.
+        let mut every: Vec<&poise::Command<Data, Error>> = Vec::new();
+        fn push_all<'a>(
+            command: &'a poise::Command<Data, Error>,
+            out: &mut Vec<&'a poise::Command<Data, Error>>,
+        ) {
+            out.push(command);
+            for sub in &command.subcommands {
+                push_all(sub, out);
+            }
+        }
+        for top in registered {
+            push_all(top, &mut every);
+        }
+
+        let found = every
             .iter()
-            .find(|c| c.name == needle);
+            .find(|c| c.qualified_name.to_lowercase() == needle);
 
         let reply = match found {
             Some(command) => {
-                let subcommands = if command.subcommands.is_empty() {
-                    "none".to_string()
-                } else {
+                let mut e = embed::titled(
+                    format!("{} /{}", tier_badge(command), command.qualified_name),
+                    embed::INFO,
+                )
+                .description(
                     command
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| "No description.".to_string()),
+                );
+
+                if !command.subcommands.is_empty() {
+                    let body = command
                         .subcommands
                         .iter()
-                        .map(|s| format!("`{}`", s.name))
+                        .filter(|s| !s.hide_in_help)
+                        .map(help_line)
                         .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                embed::titled(format!("/{}", command.name), embed::INFO)
-                    .description(
-                        command
-                            .description
-                            .clone()
-                            .unwrap_or_else(|| "No description.".to_string()),
-                    )
-                    .field("Category", command.category.clone().unwrap_or_else(|| "-".into()), true)
-                    .field("Subcommands", subcommands, false)
+                        .join("\n");
+                    e = e.field(
+                        format!("Subcommands ({})", command.subcommands.len()),
+                        text::truncate(&body, 1000),
+                        false,
+                    );
+                }
+
+                if !command.required_permissions.is_empty() {
+                    e = e.field(
+                        "Needs",
+                        format!("**{}**", command.required_permissions),
+                        true,
+                    );
+                }
+
+                e.footer(embed::footer(LEGEND))
             }
-            None => embed::err(format!("There is no command called `{needle}`.")),
+            None => embed::err(format!(
+                "There is no command called `{needle}`. Run `/help` for the list."
+            )),
         };
         ctx.send(poise::CreateReply::default().embed(reply)).await?;
         return Ok(());
     }
 
-    // Group the commands by category.
-    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for command in &ctx.framework().options().commands {
-        if command.hide_in_help {
-            continue;
+    // ---- one category, with descriptions ---------------------------------
+    if let Some(category) = category {
+        let wanted = category.key();
+        let mut matching: Vec<&poise::Command<Data, Error>> = runnable
+            .iter()
+            .filter(|(cat, _)| *cat == wanted)
+            .map(|(_, command)| *command)
+            .collect();
+        matching.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+
+        if matching.is_empty() {
+            ctx.send(
+                poise::CreateReply::default()
+                    .embed(embed::warn("Nothing is filed under that category.")),
+            )
+            .await?;
+            return Ok(());
         }
-        let category = command
-            .category
-            .clone()
-            .unwrap_or_else(|| "Other".to_string());
-        groups
-            .entry(category)
-            .or_default()
-            .push(format!("`/{}`", command.name));
+
+        let body = matching
+            .iter()
+            .map(|command| help_line(command))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // An embed description caps out at 4096 characters, and the bigger
+        // categories go past that, so send the pages as separate embeds.
+        let pages = text::chunk(&body, 3800);
+        let mut reply = poise::CreateReply::default();
+        for (index, page) in pages.iter().take(3).enumerate() {
+            let title = if index == 0 {
+                format!("📖 {wanted} — {} commands", matching.len())
+            } else {
+                format!("📖 {wanted} (continued)")
+            };
+            let mut e = embed::titled(title, embed::BRAND).description(page.clone());
+            if index + 1 == pages.len().min(3) {
+                e = e.footer(embed::footer(LEGEND));
+            }
+            reply = reply.embed(e);
+        }
+        ctx.send(reply).await?;
+        return Ok(());
     }
 
-    let mut e = embed::titled("📖 Commands", embed::BRAND).description(
-        "Run `/help <command>` for detail on one. Most configuration commands need \
-         **Manage Server**.",
-    );
+    // ---- everything, grouped -------------------------------------------
+    let mut groups: std::collections::BTreeMap<&str, Vec<&poise::Command<Data, Error>>> =
+        std::collections::BTreeMap::new();
+    for (category, command) in &runnable {
+        groups.entry(*category).or_default().push(*command);
+    }
+
+    let mut e = embed::titled(format!("📖 All {} commands", runnable.len()), embed::BRAND)
+        .description(format!(
+            "`/help category:<name>` lists one group with descriptions, and \
+             `/help command:<name>` explains one command - subcommands included, \
+             so `/help command:remind me` works.\n\n{LEGEND}"
+        ));
+
     for (category, mut commands) in groups {
-        commands.sort();
+        commands.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+        let lines = compact_lines(&commands);
         e = e.field(
             format!("{category} ({})", commands.len()),
-            text::truncate(&commands.join(" "), 1000),
+            text::truncate(&lines.join("\n"), 1000),
             false,
         );
     }
