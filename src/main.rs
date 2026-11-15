@@ -14,6 +14,7 @@ mod compat;
 mod config;
 mod gate;
 mod db;
+mod heartbeat;
 mod events;
 mod logs;
 mod modules;
@@ -137,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
                 // Load the optional phishing feed, then start the background loops.
                 tasks::refresh_phish_list(&data).await;
                 tasks::spawn_all(ctx.clone(), data.clone());
+                heartbeat::start(ctx.clone(), framework.shard_manager().clone(), data.clone());
 
                 Ok(data)
             })
@@ -152,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             tracing::info!("shutdown requested, closing connections");
+            heartbeat::farewell().await;
             shard_manager.shutdown_all().await;
         }
     });

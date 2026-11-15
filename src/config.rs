@@ -21,6 +21,11 @@ pub struct Config {
     pub font_path: Option<String>,
     /// Phishing-domain feed (newline separated) refreshed on boot. Optional.
     pub phish_list_url: Option<String>,
+    /// ops-status heartbeat (the Live Ops panel on adarsharavind.com). All
+    /// three must be set or the heartbeat stays off.
+    pub status_url: Option<String>,
+    pub status_token: Option<String>,
+    pub status_bot_id: Option<String>,
 }
 
 impl Config {
@@ -51,6 +56,9 @@ impl Config {
             translate_key: non_empty(env::var("TRANSLATE_API_KEY").ok()),
             font_path: non_empty(env::var("RANK_CARD_FONT").ok()).or_else(default_font),
             phish_list_url: non_empty(env::var("PHISH_LIST_URL").ok()),
+            status_url: non_empty(env::var("STATUS_HEARTBEAT_URL").ok()),
+            status_token: non_empty(env::var("STATUS_HEARTBEAT_TOKEN").ok()),
+            status_bot_id: non_empty(env::var("STATUS_BOT_ID").ok()),
         })
     }
 }
