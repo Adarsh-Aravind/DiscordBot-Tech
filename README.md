@@ -5,7 +5,7 @@ A community management bot for the **MrTechTrivia** Discord, written in Rust.
 - **Stack:** Rust 2021 · [serenity](https://github.com/serenity-rs/serenity) 0.12 · [poise](https://github.com/serenity-rs/poise) 0.6 · SQLite via `sqlx`
 - **Scope:** moderation and anti-abuse, welcome and roles, levelling,
   community engagement, voice rooms, announcements and reminders, utilities
-- **Commands:** 82 top-level slash commands, ~220 command definitions including subcommands
+- **Commands:** 82 top-level slash commands, 190 commands including subcommands
   (Discord allows at most 100 top-level slash commands; a test enforces it)
 - **Storage:** one SQLite file, created and migrated on first run — no external services required
 
@@ -168,7 +168,7 @@ channel).
 `/embed` `/afk` `/snipe` `/editsnipe` `/permissions`
 `/timestamp` `/help`.
 
-- `/help` lists every command grouped by category, with a badge per command for
+- `/help` lists all 190 commands grouped by category, with a badge per command for
   who may run it (🟢 anyone, 🔵 staff, 🔴 admin, 🔑 a Discord permission) taken from
   the gate itself, so it cannot drift. `/help category:Moderation` lists one group with
   descriptions; `/help command:remind me` explains a single subcommand.
